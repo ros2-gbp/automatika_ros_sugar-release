@@ -1,3 +1,26 @@
+## automatika_ros_sugar (humble) - 0.2.4-1
+
+The packages in the `automatika_ros_sugar` repository were released into the `humble` distro by running `/usr/bin/bloom-release --new-track --rosdistro humble --track humble automatika_ros_sugar` on `Fri, 27 Dec 2024 15:37:16 -0000`
+
+The `automatika_ros_sugar` package was released.
+
+Version of package(s) in repository `automatika_ros_sugar`:
+
+- upstream repository: https://github.com/automatika-robotics/ros-sugar.git
+- release repository: unknown
+- rosdistro version: `null`
+- old version: `null`
+- new version: `0.2.4-1`
+
+Versions of tools used:
+
+- bloom version: `0.12.0`
+- catkin_pkg version: `1.0.0`
+- rosdep version: `0.25.1`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/_static/ROS_SUGAR.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/_static/ROS_SUGAR_DARK.png">
