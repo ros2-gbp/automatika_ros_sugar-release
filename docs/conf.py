@@ -60,7 +60,10 @@ myst_enable_extensions = [
     "substitution",
     "tasklist",
 ]
-
+language = "en"
+myst_html_meta = {
+    "google-site-verification": "cQVj-BaADcGVOGB7GOvfbkgJjxni10C2fYWCZ03jOeo"
+}
 
 html_theme = "sphinx_book_theme"  # install with `pip install sphinx-book-theme`
 html_static_path = ["_static"]
@@ -69,5 +72,29 @@ html_theme_options = {
     "logo": {
         "image_light": "_static/ROS_SUGAR_DARK.png",
         "image_dark": "_static/ROS_SUGAR.png",
-    }
+    },
+    "icon_links": [
+        {
+            "name": "Automatika",
+            "url": "https://automatikarobotics.com/",
+            "icon": "_static/automatika-logo.png",
+            "type": "local",
+        },
+        {
+            "name": "GitHub",
+            "url": "https://github.com/automatika-robotics/ros-sugar",
+            "icon": "fa-brands fa-github",
+        },
+        {
+            "name": "Discord",
+            "url": "https://discord.gg/cAW3BWwt",
+            "icon": "fa-brands fa-discord",
+        },
+    ],
+    "path_to_docs": "docs",
+    "repository_url": "https://github.com/automatika-robotics/ros-sugar",
+    "repository_branch": "main",
+    "use_source_button": True,
+    "use_issues_button": True,
+    "use_edit_page_button": True,
 }
