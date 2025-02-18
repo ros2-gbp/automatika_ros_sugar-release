@@ -281,6 +281,9 @@ class BaseComponent(lifecycle.Node):
         if algo_config_name in self.algorithms_config.keys():
             config_dict = self.algorithms_config[algo_config_name]
             algo_config.from_dict(config_dict)
+        elif self._config_file:
+            # configure directly from YAML if available
+            algo_config.from_yaml(self._config_file, nested_root_name=f"{self.node_name}.{algo_config_name.partition('Config')[0]}")
         return algo_config
 
     # Managing Inputs/Outputs
@@ -487,8 +490,6 @@ class BaseComponent(lifecycle.Node):
         Creates all node timers
         """
         # If component is not used as a server start the main execution timer
-        if self.run_type != ComponentRunType.TIMED:
-            return
         self.get_logger().info("CREATING MAIN TIMER")
         self._execution_timer = self.create_timer(
             timer_period_sec=1 / self.config.loop_rate,
@@ -603,7 +604,7 @@ class BaseComponent(lifecycle.Node):
         Destroys all action servers
         """
         # Destroy node main Server if runtype is action server
-        if self.run_type == ComponentRunType.ACTION_SERVER:
+        if self.run_type == ComponentRunType.ACTION_SERVER and hasattr(self, "action_server"):
             self.action_server.destroy()
 
     def destroy_all_action_clients(self):
@@ -740,11 +741,11 @@ class BaseComponent(lifecycle.Node):
 
         # Check if all callbacks of the selected topics got input messages
         for callback in inputs_dict_to_check.values():
-            if not callback.got_msg:
+            if callback._subscriber and not callback.got_msg:
                 return False
         return True
 
-    def get_missing_inputs(self) -> list[str]:
+    def get_missing_inputs(self) -> List[str]:
         """
         Get a list of input topic names not being published
 
@@ -753,7 +754,7 @@ class BaseComponent(lifecycle.Node):
         """
         unpublished_topics = []
         for callback in self.callbacks.values():
-            if not callback.got_msg:
+            if callback._subscriber and not callback.got_msg:
                 unpublished_topics.append(callback.input_topic.name)
         return unpublished_topics
 
@@ -1187,7 +1188,6 @@ class BaseComponent(lifecycle.Node):
         """
         if self.run_type == ComponentRunType.ACTION_SERVER:
             raise NotImplementedError
-        pass
 
     def _main_action_goal_callback(self, _):
         """
@@ -1686,15 +1686,19 @@ class BaseComponent(lifecycle.Node):
         """
         Component execution step every loop_step
         """
+        if self.__enable_health_publishing and self.health_status_publisher:
+            self.health_status_publisher.publish(self.health_status())
+
+        # If it is not a timed component -> only publish status
+        if self.run_type != ComponentRunType.TIMED:
+            return
+
         # Additional execution loop if exists
         if hasattr(self, "_extra_execute_loop"):
             self._extra_execute_loop()
 
         # Execute main loop
         self._execution_step()
-
-        if self.__enable_health_publishing and self.health_status_publisher:
-            self.health_status_publisher.publish(self.health_status())
 
         # Execute once
         if not hasattr(self, "_exec_started"):
@@ -1703,19 +1707,17 @@ class BaseComponent(lifecycle.Node):
                 self._extra_execute_once()
             self._exec_started = True
 
-    # ABSTRACT METHODS
-    @abstractmethod
+    # Timed runtype execution step
     def _execution_step(self):
         """
         Main execution of the component, executed at each timer tick with rate 'loop_rate' from config
         """
-        raise NotImplementedError(
-            "Child components should implement a main execution step"
-        )
+        raise NotImplementedError
 
+    # Timed runtype execution step
     def _execute_once(self):
         """
-        Executed once when the component is started
+        Executed once when the component is started in TIMED runtype
         """
         pass
 
