@@ -1,0 +1,12 @@
+Source: ros-humble-automatika-ros-sugar
+Section: misc
+Priority: optional
+Maintainer: Automatika Robotics <contact@automatikarobotics.com>
+Build-Depends: debhelper (>= 9.0.0), python3-jinja2, python3-msgpack, python3-numpy, python3-opencv, python3-pytest <!nocheck>, python3-setproctitle, ros-humble-ament-cmake, ros-humble-ament-cmake-pytest <!nocheck>, ros-humble-ament-cmake-python, ros-humble-ament-index-python <!nocheck>, ros-humble-ament-lint-auto <!nocheck>, ros-humble-builtin-interfaces, ros-humble-geometry-msgs, ros-humble-launch <!nocheck>, ros-humble-launch-testing <!nocheck>, ros-humble-lifecycle-msgs, ros-humble-nav-msgs, ros-humble-rclcpp, ros-humble-rclpy, ros-humble-rosidl-default-generators, ros-humble-sensor-msgs, ros-humble-std-msgs, ros-humble-tf2-ros, ros-humble-ros-workspace, ros-humble-rosidl-typesupport-fastrtps-c, ros-humble-rosidl-typesupport-fastrtps-cpp
+Homepage: https://github.com/automatika/ros-sugar
+Standards-Version: 3.9.2
+
+Package: ros-humble-automatika-ros-sugar
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3-jinja2, python3-msgpack, python3-numpy, python3-opencv, python3-setproctitle, ros-humble-builtin-interfaces, ros-humble-geometry-msgs, ros-humble-lifecycle-msgs, ros-humble-nav-msgs, ros-humble-rclcpp, ros-humble-rclpy, ros-humble-rosidl-default-runtime, ros-humble-sensor-msgs, ros-humble-std-msgs, ros-humble-tf2-ros, ros-humble-ros-workspace
+Description: Syntactic sugar for ROS2 nodes creation and management
