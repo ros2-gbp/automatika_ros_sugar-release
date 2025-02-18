@@ -125,7 +125,14 @@ class OnChange(Event):
         :rtype: None
         """
         # passing trigger_value as zero as it will not be used in this event
-        super().__init__(event_name, event_source, None, nested_attributes, **kwargs)
+        super().__init__(
+            event_name=event_name,
+            event_source=event_source,
+            trigger_value=None,
+            nested_attributes=nested_attributes,
+            **kwargs,
+        )
+        self._previous_event_value = None
 
     def callback(self, msg) -> None:
         """
@@ -142,7 +149,10 @@ class OnChange(Event):
         """
         Set trigger  to True if event value is equal to reference value
         """
-        if self._event_value != self._previous_event_value:
+        if (
+            self._previous_event_value is not None
+            and self._event_value != self._previous_event_value
+        ):
             self.trigger = True
         else:
             self.trigger = False
@@ -187,6 +197,7 @@ class OnChangeEqual(Event):
         super().__init__(
             event_name, event_source, trigger_value, nested_attributes, **kwargs
         )
+        self._previous_event_value = None
 
     def callback(self, msg) -> None:
         """
@@ -203,7 +214,7 @@ class OnChangeEqual(Event):
         """
         Set trigger  to True if event value is equal to reference value
         """
-        if hasattr(self, "_previous_event_value"):
+        if self._previous_event_value is not None:
             if (
                 self._event_value != self._previous_event_value
                 and self._event_value == self.trigger_ref_value
@@ -211,6 +222,8 @@ class OnChangeEqual(Event):
                 self.trigger = True
             else:
                 self.trigger = False
+        else:
+            self.trigger = False
 
 
 class OnEqual(Event):
@@ -283,7 +296,12 @@ class OnContainsAll(Event):
         """
         Set trigger  to True if event value contains all of the reference values
         """
-        self.trigger = self.trigger_ref_value in self._event_value
+        if isinstance(self.trigger_ref_value, List):
+            self.trigger = all(
+                val in self._event_value for val in self.trigger_ref_value
+            )
+        else:
+            self.trigger = self.trigger_ref_value in self._event_value
 
 
 class OnContainsAny(Event):
@@ -394,7 +412,8 @@ class OnGreater(Event):
         super().__init__(
             event_name, event_source, trigger_value, nested_attributes, **kwargs
         )
-        self._or_equal = or_equal
+        if isinstance(event_source, Topic):
+            self._or_equal = or_equal
 
     def _update_trigger(self) -> None:
         """
@@ -405,8 +424,31 @@ class OnGreater(Event):
         else:
             self.trigger = self._event_value > self.trigger_ref_value
 
+    @property
+    def dictionary(self) -> Dict:
+        """
+        Property to parse the event into a dictionary
 
-class OnLess(Event):
+        :return: Event description dictionary
+        :rtype: Dict
+        """
+        event_dict = Event.dictionary.fget(self)
+        event_dict["or_equal"] = self._or_equal
+        return event_dict
+
+    @dictionary.setter
+    def dictionary(self, dict_obj: Dict) -> None:
+        """
+        Setter of the event using a dictionary
+
+        :param dict_obj: Event description dictionary
+        :type dict_obj: Dict
+        """
+        Event.dictionary.fset(self, dict_obj)
+        self._or_equal = dict_obj["or_equal"]
+
+
+class OnLess(OnGreater):
     """
     OnGreater Event is triggered when a given topic attribute value is less than a given trigger value.
 
@@ -437,9 +479,13 @@ class OnLess(Event):
         :rtype: None
         """
         super().__init__(
-            event_name, event_source, trigger_value, nested_attributes, **kwargs
+            event_name,
+            event_source,
+            trigger_value,
+            nested_attributes,
+            or_equal,
+            **kwargs,
         )
-        self._or_equal = or_equal
 
     def _update_trigger(self) -> None:
         """
