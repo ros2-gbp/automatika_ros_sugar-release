@@ -1,0 +1,12 @@
+Source: ros-jazzy-automatika-ros-sugar
+Section: misc
+Priority: optional
+Maintainer: Automatika Robotics <contact@automatikarobotics.com>
+Build-Depends: debhelper (>= 9.0.0), python3-jinja2, python3-msgpack, python3-numpy, python3-opencv, python3-pytest <!nocheck>, python3-setproctitle, ros-jazzy-ament-cmake, ros-jazzy-ament-cmake-pytest <!nocheck>, ros-jazzy-ament-cmake-python, ros-jazzy-ament-index-python <!nocheck>, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-builtin-interfaces, ros-jazzy-geometry-msgs, ros-jazzy-launch <!nocheck>, ros-jazzy-launch-testing <!nocheck>, ros-jazzy-lifecycle-msgs, ros-jazzy-nav-msgs, ros-jazzy-rclcpp, ros-jazzy-rclpy, ros-jazzy-rosidl-default-generators, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-tf2-ros, ros-jazzy-ros-workspace, ros-jazzy-rosidl-typesupport-fastrtps-c, ros-jazzy-rosidl-typesupport-fastrtps-cpp
+Homepage: https://github.com/automatika/ros-sugar
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-automatika-ros-sugar
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3-jinja2, python3-msgpack, python3-numpy, python3-opencv, python3-setproctitle, ros-jazzy-builtin-interfaces, ros-jazzy-geometry-msgs, ros-jazzy-lifecycle-msgs, ros-jazzy-nav-msgs, ros-jazzy-rclcpp, ros-jazzy-rclpy, ros-jazzy-rosidl-default-runtime, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-tf2-ros, ros-jazzy-ros-workspace
+Description: Syntactic sugar for ROS2 nodes creation and management
