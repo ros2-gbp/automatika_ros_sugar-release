@@ -95,7 +95,7 @@ class ComponentActions:
             "srv_type": srv_type,
             "srv_request_msg": srv_request_msg,
         }
-
+        # Action with an empty callable
         stack_action = Action(method=lambda *_: None, kwargs=kwargs)
         stack_action.action_name = "send_srv_request"
         stack_action._is_monitor_action = True
@@ -174,7 +174,10 @@ class ComponentActions:
         :return: Component start action
         :rtype: Action
         """
-        return Action(method=component.start)
+        # Action with an empty callable
+        stack_action = Action(method=component.start)
+        stack_action._is_lifecycle_action = True
+        return stack_action
 
     @classmethod
     @_validate_component_action
@@ -187,7 +190,10 @@ class ComponentActions:
         :return: Component stop action
         :rtype: Action
         """
-        return Action(method=component.stop)
+        # Action with an empty callable
+        stack_action = Action(method=component.stop)
+        stack_action._is_lifecycle_action = True
+        return stack_action
 
     @classmethod
     @_validate_component_action
@@ -204,7 +210,10 @@ class ComponentActions:
         :return: Component restart action
         :rtype: Action
         """
-        return Action(method=component.restart, kwargs={"wait_time": wait_time})
+        # Action with an empty callable
+        stack_action = Action(method=component.restart, kwargs={"wait_time": wait_time})
+        stack_action._is_lifecycle_action = True
+        return stack_action
 
     @classmethod
     def reconfigure(
@@ -218,7 +227,7 @@ class ComponentActions:
 
         :param component: Component
         :type component: BaseComponent
-        :param new_config: Component config class or path to YAML config file
+        :param new_config: Component config class or path to config file
         :type new_config: Union[str, object]
         :param keep_alive: To keep the component running when reconfiguring, defaults to False
         :type keep_alive: bool, optional
@@ -232,17 +241,14 @@ class ComponentActions:
             "keep_alive": keep_alive,
         }
 
-        def empty_callable(*_):
-            return None
-
         if not isinstance(new_config, str) and not isinstance(
             new_config, component.config.__class__
         ):
             raise TypeError(
-                f"Incompatible config type '{type(new_config)}'. Cannot reconfigure {component.node_name}. config should be either a '{component.config.__class__}' instance or 'str' with path to YAML config file"
+                f"Incompatible config type '{type(new_config)}'. Cannot reconfigure {component.node_name}. config should be either a '{component.config.__class__}' instance or 'str' with path to valid config file (yaml, json, toml)"
             )
-        # Setup Monitor action
-        stack_action = Action(method=empty_callable, kwargs=kwargs)
+        # Action with an empty callable
+        stack_action = Action(method=lambda *_: None, kwargs=kwargs)
         stack_action.action_name = "configure_component"
         stack_action._is_monitor_action = True
         return stack_action
@@ -276,12 +282,8 @@ class ComponentActions:
             "new_value": new_value,
             "keep_alive": keep_alive,
         }
-
-        def empty_callable(*_):
-            return None
-
-        # Setup Monitor action
-        stack_action = Action(method=empty_callable, kwargs=kwargs)
+        # Action with an empty callable
+        stack_action = Action(method=lambda *_: None, kwargs=kwargs)
         stack_action.action_name = "update_parameter"
         stack_action._is_monitor_action = True
         return stack_action
@@ -316,10 +318,8 @@ class ComponentActions:
             "keep_alive": keep_alive,
         }
 
-        def empty_callable(*_):
-            return None
-
-        stack_action = Action(method=empty_callable, kwargs=kwargs)
+        # Action with an empty callable
+        stack_action = Action(method=lambda *_: None, kwargs=kwargs)
         # Setup Monitor action
         stack_action.action_name = "update_parameters"
         stack_action._is_monitor_action = True
