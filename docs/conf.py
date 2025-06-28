@@ -20,6 +20,7 @@ extensions = [
     "sphinx_copybutton",  # install with `pip install sphinx-copybutton`
     "autodoc2",  # install with `pip install sphinx-autodoc2`
     "myst_parser",  # install with `pip install myst-parser`
+    "sphinx_sitemap",  # install with `pip install sphinx-sitemap`
 ]
 
 autodoc2_packages = [
@@ -39,7 +40,7 @@ autodoc2_render_plugin = "myst"
 
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README*"]
 
 myst_enable_extensions = [
     "amsmath",
@@ -62,9 +63,13 @@ myst_html_meta = {
 }
 myst_heading_anchors = 7  # to remove cross reference errors with md
 
+html_baseurl = "https://automatika-robotics.github.com/sugarcoat/"
 language = "en"
 html_theme = "sphinx_book_theme"  # install with `pip install sphinx-book-theme`
 html_static_path = ["_static"]
+html_css_files = [
+    "custom.css",
+]
 html_favicon = "_static/favicon.png"
 
 html_theme_options = {
