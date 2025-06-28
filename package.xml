@@ -2,10 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>automatika_ros_sugar</name>
-  <version>0.2.9</version>
+  <version>0.3.1</version>
   <description>Syntactic sugar for ROS2 nodes creation and management</description>
   <maintainer email="contact@automatikarobotics.com">Automatika Robotics</maintainer>
-  <url type="website">https://github.com/automatika/ros-sugar</url>
+  <url type="website">https://github.com/automatika-robotics/sugarcoat</url>
   <license>MIT</license>
 
     <buildtool_depend>ament_cmake</buildtool_depend>
@@ -19,10 +19,14 @@
   <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>python3-attrs</depend>
+  <depend>python3-toml</depend>
+  <depend>python3-yaml</depend>
   <depend>python3-numpy</depend>
   <depend>python3-opencv</depend>
   <depend>python3-jinja2</depend>
   <depend>python3-msgpack</depend>
+  <depend>python3-msgpack-numpy</depend>
   <depend>python3-setproctitle</depend>
 
   <test_depend>ament_cmake_pytest</test_depend>

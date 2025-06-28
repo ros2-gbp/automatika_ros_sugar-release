@@ -1,4 +1,5 @@
 """Launcher"""
+
 from __future__ import annotations
 import os
 import inspect
@@ -68,7 +69,7 @@ class Launcher:
 
     ## Available options:
     - Provide a ROS2 namespace to all the components
-    - Provide a YAML config file.
+    - Provide a config file.
     - Enable/Disable events monitoring
 
     Launcher forwards all the provided Events to its internal Monitor, when the Monitor detects an Event trigger it emits an InternalEvent back to the Launcher. Execution of the Action is done directly by the Launcher or a request is forwarded to the Monitor depending on the selected run method (multi-processes or multi-threaded).
@@ -89,7 +90,7 @@ class Launcher:
 
         :param namespace: ROS2 namespace for all the nodes, defaults to ""
         :type namespace: str, optional
-        :param config_file: Path to Yaml configuration file, defaults to None
+        :param config_file: Path to configuration file, defaults to None
         :type config_file: str | None, optional
         :param enable_monitoring: Enable components health status monitoring, defaults to True
         :type enable_monitoring: bool, optional
@@ -115,7 +116,7 @@ class Launcher:
         self._pkg_executable: List[Tuple[Optional[str], Optional[str]]] = []
 
         # To track each package log level when the pkg is added
-        self._pkg_log_level: Dict[str, str] = {}
+        self._rclpy_log_level: Dict[str, str] = {}
 
         # Component: run_in_process (true/false)
         self.__component_names_to_activate_on_start_mp: List[
@@ -153,6 +154,7 @@ class Launcher:
         activate_all_components_on_start: bool = True,
         components_to_activate_on_start: Optional[List[BaseComponent]] = None,
         ros_log_level: Optional[str] = None,
+        rclpy_log_level: Optional[str] = None,
     ):
         """Add component or a set of components to the launcher from one ROS2 package based on ros_sugar
 
@@ -170,8 +172,10 @@ class Launcher:
         :type activate_all_components_on_start: bool, optional
         :param components_to_activate_on_start: Set of components to activate on bringup, defaults to None
         :type components_to_activate_on_start: Optional[List[BaseComponent]], optional
-        :param ros_log_level: Selected ROS logging level for the package components, defaults to None
+        :param ros_log_level: Selected logging level for the package components. If provided, it overrides the components 'log_level' config parameter, defaults to None
         :type ros_log_level: str, optional
+        :param rclpy_log_level: Selected ROS internal (RCLPY and RMW) logging level for the package components, defaults to None
+        :type rclpy_log_level: str, optional
         """
         # If multi processing is enabled -> check for package and executable name
         if multiprocessing and (not package_name or not executable_entry_point):
@@ -210,15 +214,17 @@ class Launcher:
         # Parse provided Events/Actions
         if events_actions and self.__enable_monitoring:
             # Rewrite the actions dictionary and updates actions to be passed to the monitor and to the components
-            self.__rewrite_actions_for_components(components, events_actions)
+            self.__rewrite_actions_for_components(self._components, events_actions)
 
         # Configure components from config_file
         for component in components:
+            if rclpy_log_level:
+                self._rclpy_log_level[component.node_name] = rclpy_log_level
             if ros_log_level:
-                self._pkg_log_level[component.node_name] = ros_log_level
+                component.config.log_level = ros_log_level
             if self._config_file:
                 component._config_file = self._config_file
-                component.config_from_yaml(self._config_file)
+                component.config_from_file(self._config_file)
 
     def _setup_component_events_handlers(self, comp: BaseComponent):
         """Parse a component events/actions from the overall components actions
@@ -282,9 +288,19 @@ class Launcher:
                         raise InvalidAction(
                             f"Invalid action for condition '{condition.name}'. Action component '{action_object}' is unknown or not added to Launcher"
                         )
-                    self.__update_dict_list(
-                        self._components_actions, serialized_condition, action
-                    )
+                    if action.lifecycle_action:
+                        # lifecycle action to parse from the launcher
+                        self.__update_dict_list(
+                            self._ros_actions, condition.name, action
+                        )
+                        if not self._internal_events:
+                            self._internal_events = [condition]
+                        elif condition not in self._internal_events:
+                            self._internal_events.append(condition)
+                    else:
+                        self.__update_dict_list(
+                            self._components_actions, serialized_condition, action
+                        )
                 elif isinstance(action, Action) and action.monitor_action:
                     # Action to execute through the monitor
                     self.__update_dict_list(
@@ -477,7 +493,7 @@ class Launcher:
                     entities_dict[event_name].append(action)
 
                 # Check action type
-                elif action.component_action and nodes_in_processes:
+                elif action.lifecycle_action:
                     # Re-parse action for component related actions
                     entities = self._get_action_launch_entity(action)
                     if isinstance(entities, list):
@@ -630,7 +646,6 @@ class Launcher:
         component: BaseComponent,
         pkg_name: str,
         executable_name: str,
-        ros_log_level: str = "info",
     ):
         """
         Sets up the launch actions to start the components in separate processes
@@ -641,11 +656,19 @@ class Launcher:
         name = component.node_name
         component._update_cmd_args_list()
         self._setup_external_processors(component)
-        ros_log_level = (
-            self._pkg_log_level[component.node_name]
-            if component.node_name in self._pkg_log_level
-            else ros_log_level
+        rclpy_log_level = (
+            self._rclpy_log_level[component.node_name]
+            if component.node_name in self._rclpy_log_level
+            else None
         )
+        if rclpy_log_level:
+            arguments = component.launch_cmd_args + [
+                "--ros-args",
+                "--log-level",
+                rclpy_log_level,
+            ]
+        else:
+            arguments = component.launch_cmd_args
         # Check if the component is a lifecycle node
         if issubclass(component.__class__, ManagedEntity):
             new_node = LifecycleNodeLaunchAction(
@@ -655,8 +678,7 @@ class Launcher:
                 name=name,
                 executable=executable_name,
                 output="screen",
-                arguments=component.launch_cmd_args
-                + ["--ros-args", "--log-level", ros_log_level],
+                arguments=arguments,
             )
         else:
             new_node = NodeLaunchAction(
@@ -666,27 +688,23 @@ class Launcher:
                 name=name,
                 executable=executable_name,
                 output="screen",
-                arguments=component.launch_cmd_args
-                + ["--ros-args", "--log-level", ros_log_level],
+                arguments=arguments,
             )
 
         self._launch_group.append(new_node)
 
-    def _setup_component_in_thread(self, component, ros_log_level: str = "info"):
+    def _setup_component_in_thread(self, component: BaseComponent):
         """
         Adds all components to be launched in separate threads
         """
-        ros_log_level = (
-            self._pkg_log_level[component.node_name]
-            if component.node_name in self._pkg_log_level
-            else ros_log_level
-        )
         component_action = ComponentLaunchAction(
             node=component,
             namespace=self._namespace,
             name=component.node_name,
             output="screen",
-            log_level=logging.get_logging_severity_from_string(ros_log_level),
+            log_level=logging.get_logging_severity_from_string(
+                component.config.log_level
+            ),
         )
         self._launch_group.append(component_action)
 
@@ -722,9 +740,9 @@ class Launcher:
         component_name: str | None = None,
     ):
         """
-        Configure components managed by the Orchestrator
+        Configure components managed by the Launcher
 
-        :param config_file: Path to configuration file (yaml)
+        :param config_file: Path to configuration file (yaml, json ot toml)
         :type config_file: str
         :param component_name: Configure one component with given name, defaults to None
         :type component_name: str | None, optional
@@ -734,12 +752,12 @@ class Launcher:
         if component_name:
             for component in self._components:
                 if component.node_name == component_name:
-                    component.config_from_yaml(config_file)
+                    component.config_from_file(config_file)
             return
 
         # If no component is specified -> configure all components
         for component in self._components:
-            component.config_from_yaml(config_file)
+            component.config_from_file(config_file)
 
     def add_py_executable(self, path_to_executable: str, name: str = "python3"):
         """
@@ -797,13 +815,13 @@ class Launcher:
 
     def setup_launch_description(
         self,
-        ros_log_level: str = "info",
     ):
         self._check_duplicate_names()
 
         # SET PROCESS NAME (if setproctitle is available)
         try:
             import setproctitle
+
             setproctitle.setproctitle(logger.name)
         except ImportError:
             pass
@@ -817,11 +835,9 @@ class Launcher:
         for idx, component in enumerate(self._components):
             pkg_name, executable_name = self._pkg_executable[idx]
             if pkg_name and executable_name:
-                self._setup_component_in_process(
-                    component, pkg_name, executable_name, ros_log_level
-                )
+                self._setup_component_in_process(component, pkg_name, executable_name)
             else:
-                self._setup_component_in_thread(component, ros_log_level)
+                self._setup_component_in_thread(component)
 
         group_action = GroupAction(self._launch_group)
 
@@ -832,7 +848,6 @@ class Launcher:
         config_file: str | None = None,
         introspect: bool = False,
         launch_debug: bool = False,
-        ros_log_level: str = "info",
     ):
         """
         Bring up the Launcher
@@ -845,7 +860,7 @@ class Launcher:
         if config_file:
             self.configure(config_file)
 
-        self.setup_launch_description(ros_log_level)
+        self.setup_launch_description()
 
         self._start_ros_launch(introspect, launch_debug)
 
