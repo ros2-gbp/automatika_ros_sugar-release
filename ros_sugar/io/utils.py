@@ -1,10 +1,78 @@
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 from nav_msgs.msg import Odometry
-from quaternion import quaternion
 import cv2
 import std_msgs.msg as std_msg
+
+
+def _process_encoding(encoding: str) -> Tuple[np.dtype, int]:
+    """
+    Returns dtype and number of channels from encoding
+    """
+    encoding = encoding.lower()
+
+    # Define mapping from encoding to (dtype, channels)
+    encoding_map = {
+        # RGB/BGR family
+        "rgb8": (np.uint8, 3),
+        "rgba8": (np.uint8, 4),
+        "rgb16": (np.uint16, 3),
+        "rgba16": (np.uint16, 4),
+        "bgr8": (np.uint8, 3),
+        "bgra8": (np.uint8, 4),
+        "bgr16": (np.uint16, 3),
+        "bgra16": (np.uint16, 4),
+        # Mono
+        "mono8": (np.uint8, 1),
+        "mono16": (np.uint16, 1),
+        # Bayer – typically raw single-channel
+        "bayer_rggb8": (np.uint8, 1),
+        "bayer_bggr8": (np.uint8, 1),
+        "bayer_gbrg8": (np.uint8, 1),
+        "bayer_grbg8": (np.uint8, 1),
+        "bayer_rggb16": (np.uint16, 1),
+        "bayer_bggr16": (np.uint16, 1),
+        "bayer_gbrg16": (np.uint16, 1),
+        "bayer_grbg16": (np.uint16, 1),
+        # CvMat types
+        "8uc1": (np.uint8, 1),
+        "8uc2": (np.uint8, 2),
+        "8uc3": (np.uint8, 3),
+        "8uc4": (np.uint8, 4),
+        "8sc1": (np.int8, 1),
+        "8sc2": (np.int8, 2),
+        "8sc3": (np.int8, 3),
+        "8sc4": (np.int8, 4),
+        "16uc1": (np.uint16, 1),
+        "16uc2": (np.uint16, 2),
+        "16uc3": (np.uint16, 3),
+        "16uc4": (np.uint16, 4),
+        "16sc1": (np.int16, 1),
+        "16sc2": (np.int16, 2),
+        "16sc3": (np.int16, 3),
+        "16sc4": (np.int16, 4),
+        "32sc1": (np.int32, 1),
+        "32sc2": (np.int32, 2),
+        "32sc3": (np.int32, 3),
+        "32sc4": (np.int32, 4),
+        "32fc1": (np.float32, 1),
+        "32fc2": (np.float32, 2),
+        "32fc3": (np.float32, 3),
+        "32fc4": (np.float32, 4),
+        "64fc1": (np.float64, 1),
+        "64fc2": (np.float64, 2),
+        "64fc3": (np.float64, 3),
+        "64fc4": (np.float64, 4),
+        "yuv422": (np.uint8, 2),
+    }
+
+    if encoding not in encoding_map:
+        if "yuv422" in encoding:
+            return encoding_map["yuv422"]
+        raise ValueError(f"Unsupported encoding: {encoding}")
+
+    return encoding_map[encoding]
 
 
 def image_pre_processing(img) -> np.ndarray:
@@ -16,19 +84,26 @@ def image_pre_processing(img) -> np.ndarray:
     :returns:   Image as an numpy array
     :rtype:     Numpy array
     """
-    if img.encoding == "yuv422_yuy2":
-        np_arr = np.asarray(img.data, dtype="uint8").reshape((img.height, img.width, 2))
-        np_arr = cv2.cvtColor(np_arr, cv2.COLOR_YUV2RGB_YUYV)
-
-    # discard alpha channels if present
-    elif "a" in img.encoding:
-        np_arr = np.asarray(img.data, dtype="uint8").reshape((
+    dtype, num_channels = _process_encoding(img.encoding)
+    if num_channels > 1:
+        np_arr = np.asarray(img.data, dtype=dtype).reshape((
             img.height,
             img.width,
-            4,
+            num_channels,
+        ))
+    # discard alpha channels if present
+    elif num_channels == 4:
+        np_arr = np.asarray(img.data, dtype=dtype).reshape((
+            img.height,
+            img.width,
+            num_channels,
         ))[:, :, :3]
     else:
-        np_arr = np.asarray(img.data, dtype="uint8").reshape((img.height, img.width, 3))
+        np_arr = np.asarray(img.data, dtype=dtype).reshape((img.height, img.width))
+
+    if img.encoding == "yuv422_yuy2":
+        np_arr = cv2.cvtColor(np_arr, cv2.COLOR_YUV2RGB_YUYV)
+        np_arr = cv2.cvtColor(np_arr, cv2.COLOR_BGR2RGB)
 
     # handle bgr
     rgb = cv2.cvtColor(np_arr, cv2.COLOR_BGR2RGB) if "bgr" in img.encoding else np_arr
@@ -50,28 +125,48 @@ def read_compressed_image(img) -> np.ndarray:
     return cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
 
 
-def rotate_vector_by_quaternion(q: quaternion, v: List) -> List:
+def _np_quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """
-    rotate a vector v by a rotation quaternion q
-
-    :param      q: the rotation to perform
-    :type       q: quaternion.quaternion
-    :param      v: the vector to be rotated
-    :type       v: List
-
-    :return:    the rotated position of the vector
-    :rtype:     List
+    Multiplies two quaternions q1 * q2
+    Each quaternion is an array [w, x, y, z]
     """
-    vq = quaternion(0, 0, 0, 0)
-    vq.imag = v
-    return (q * vq * q.inverse()).imag
+    w0, x0, y0, z0 = q1
+    w1, x1, y1, z1 = q2
+    return np.array([
+        w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
+        w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+        w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
+        w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
+    ])
+
+
+def _np_quaternion_conjugate(q: np.ndarray) -> np.ndarray:
+    """
+    Returns the conjugate of a quaternion
+    """
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z])
+
+
+def rotate_vector_by_quaternion(q: np.ndarray, v: List[float]) -> List[float]:
+    """
+    Rotate a 3D vector v by a quaternion q.
+
+    :param      q: quaternion [w, x, y, z]
+    :param      v: vector [x, y, z]
+    :return:    rotated vector
+    """
+    vq = np.array([0.0, *v])
+    q_conj = _np_quaternion_conjugate(q)
+    rotated_vq = _np_quaternion_multiply(_np_quaternion_multiply(q, vq), q_conj)
+    return rotated_vq[1:].tolist()
 
 
 def get_pose_target_in_reference_frame(
     reference_position: np.ndarray,
-    reference_orientation: quaternion,
+    reference_orientation: np.ndarray,
     target_position: np.ndarray,
-    target_orientation: quaternion,
+    target_orientation: np.ndarray,
 ) -> np.ndarray:
     """
     Computes a target pose with respect to a reference pose, both given in a common coordinates frame
@@ -79,28 +174,31 @@ def get_pose_target_in_reference_frame(
     :param reference_position: Position of reference in common frame [x, y, z]
     :type reference_position: np.ndarray
     :param reference_orientation: Orientation quaternion of reference in common frame (qw, qx, qy, qz)
-    :type reference_orientation: quaternion
+    :type reference_orientation: np.ndarray
     :param target_position: Position of target in common frame [x, y, z]
     :type target_position: np.ndarray
     :param target_orientation: Orientation quaternion of target in common frame (qw, qx, qy, qz)
-    :type target_orientation: quaternion
+    :type target_orientation: np.ndarray
 
-    :return: Position and oreintation quaternion of target in reference frame [x, y, z, qw, qx, qy, qz]
+    :return: Position and orientation quaternion of target in reference frame [x, y, z, qw, qx, qy, qz]
     :rtype: np.ndarray
     """
-    orientation_target_in_ref = reference_orientation.inverse() * target_orientation
+    orientation_target_in_ref = (
+        _np_quaternion_conjugate(reference_orientation) * target_orientation
+    )
     position_target_in_ref = rotate_vector_by_quaternion(
-        reference_orientation.inverse(), (target_position - reference_position).tolist()
+        _np_quaternion_conjugate(reference_orientation),
+        (target_position - reference_position).tolist(),
     )
 
     target_pose_in_ref = np.array([
         position_target_in_ref[0],
         position_target_in_ref[1],
         position_target_in_ref[2],
-        orientation_target_in_ref.w,
-        orientation_target_in_ref.x,
-        orientation_target_in_ref.y,
-        orientation_target_in_ref.z,
+        orientation_target_in_ref[0],
+        orientation_target_in_ref[1],
+        orientation_target_in_ref[2],
+        orientation_target_in_ref[3],
     ])
 
     return target_pose_in_ref
@@ -142,7 +240,7 @@ def _get_odom_from_ndarray(odom_array: np.ndarray) -> Odometry:
     return odom_msg
 
 
-def _get_orientation_from_odom(odom_msg: Odometry) -> quaternion:
+def _get_orientation_from_odom(odom_msg: Odometry) -> np.ndarray:
     """
     Gets a rotation quaternion from Odometry message
 
@@ -150,14 +248,14 @@ def _get_orientation_from_odom(odom_msg: Odometry) -> quaternion:
     :type odom_msg: Odometry
 
     :return: Rotation quaternion (qw, qx, qy, qz)
-    :rtype: quaternion
+    :rtype: np.ndarray
     """
-    return quaternion(
+    return np.array([
         odom_msg.pose.pose.orientation.w,
         odom_msg.pose.pose.orientation.x,
         odom_msg.pose.pose.orientation.y,
         odom_msg.pose.pose.orientation.z,
-    )
+    ])
 
 
 def odom_from_frame1_to_frame2(
@@ -185,9 +283,12 @@ def odom_from_frame1_to_frame2(
 
     pose_target_in_2 = get_pose_target_in_reference_frame(
         reference_position=pose_2_in_1[:3],
-        reference_orientation=quaternion(
-            pose_2_in_1[3], pose_2_in_1[4], pose_2_in_1[5], pose_2_in_1[6]
-        ),
+        reference_orientation=np.array([
+            pose_2_in_1[3],
+            pose_2_in_1[4],
+            pose_2_in_1[5],
+            pose_2_in_1[6],
+        ]),
         target_position=_get_position_from_odom(pose_target_in_1),
         target_orientation=_get_orientation_from_odom(pose_target_in_1),
     )
@@ -206,16 +307,16 @@ def _parse_array_type(arr: np.ndarray, ros_msg_cls: type) -> np.ndarray:
     :return: Parsed data
     :rtype: np.ndarray
     """
-    if ros_msg_cls==std_msg.Float32MultiArray:
+    if ros_msg_cls == std_msg.Float32MultiArray:
         arr = arr.astype(np.float32)
-    elif ros_msg_cls==std_msg.Float64MultiArray:
+    elif ros_msg_cls == std_msg.Float64MultiArray:
         arr = arr.astype(np.float64)
-    elif ros_msg_cls==std_msg.Int16MultiArray:
-            arr = arr.astype(np.int16)
-    elif ros_msg_cls==std_msg.Int32MultiArray:
-            arr = arr.astype(np.int32)
-    elif ros_msg_cls==std_msg.Int64MultiArray:
-            arr = arr.astype(np.int64)
+    elif ros_msg_cls == std_msg.Int16MultiArray:
+        arr = arr.astype(np.int16)
+    elif ros_msg_cls == std_msg.Int32MultiArray:
+        arr = arr.astype(np.int32)
+    elif ros_msg_cls == std_msg.Int64MultiArray:
+        arr = arr.astype(np.int64)
     return arr
 
 

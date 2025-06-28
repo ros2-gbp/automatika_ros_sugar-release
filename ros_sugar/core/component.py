@@ -3,17 +3,21 @@
 import os
 import time
 import json
+import yaml
+import toml
 import socket
-from omegaconf import OmegaConf
 from abc import abstractmethod
+import threading
 from typing import Any, Dict, List, Optional, Union, Callable, Sequence, Tuple
 from functools import wraps
 
+from rclpy import logging as rclpy_logging
 from rclpy.action.server import ActionServer, CancelResponse, GoalResponse
 from rclpy.utilities import try_shutdown
 import rclpy.callback_groups as ros_callback_groups
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy import lifecycle
+from rclpy.lifecycle.node import TransitionCallbackReturn, LifecycleState
 from rclpy.publisher import Publisher as ROSPublisher
 from rclpy.subscription import Subscription
 from rclpy.client import Client
@@ -24,7 +28,7 @@ from automatika_ros_sugar.msg import ComponentStatus
 from automatika_ros_sugar.srv import (
     ChangeParameter,
     ChangeParameters,
-    ConfigureFromYaml,
+    ConfigureFromFile,
     ReplaceTopic,
     ExecuteMethod,
 )
@@ -39,8 +43,8 @@ from .fallbacks import ComponentFallbacks, Fallback
 from .status import Status
 from ..utils import (
     camel_to_snake_case,
-    component_action,
     component_fallback,
+    component_action,
     get_methods_with_decorator,
     log_srv,
 )
@@ -73,7 +77,7 @@ class BaseComponent(lifecycle.Node):
         :type outputs: Optional[Sequence[Topic]], optional
         :param config: Component config, defaults to None
         :type config: Optional[BaseComponentConfig], optional
-        :param config_file: Path to YAML configuration file, defaults to None
+        :param config_file: Path to configuration file (yaml, json, toml), defaults to None
         :type config_file: Optional[str], optional
         :param callback_group: Main callback group, defaults to None
         :type callback_group: rclpy.callback_groups.CallbackGroup, optional
@@ -164,6 +168,11 @@ class BaseComponent(lifecycle.Node):
             str, Dict
         ] = {}  # Dictionary of user defined algorithms configuration
 
+        # Main goal handle (to execute one goal at a time)
+        # TODO add config parameter (one goal vs goal queue)
+        self._main_goal_handle = None
+        self._main_goal_lock = threading.Lock()
+
         # To use without launcher -> Init the ROS2 node directly
         if self.config.use_without_launcher:
             self.rclpy_init_node(component_name, **kwargs)
@@ -172,11 +181,16 @@ class BaseComponent(lifecycle.Node):
         """
         To init the node with rclpy and activate default services
         """
+        # Apply Logging Level
+        rclpy_logging.set_logger_level(
+            self.node_name,
+            rclpy_logging.get_logging_severity_from_string(self.config.log_level),
+        )
+        # Activate Node
         lifecycle.Node.__init__(self, self.node_name, *args, **kwargs)
         self.get_logger().info(
             f"LIFECYCLE NODE {self.get_name()} STARTED AND REQUIRES CONFIGURATION"
         )
-        self._create_default_services()
 
     def is_node_initialized(self) -> bool:
         """Checks if the rclpy Node is initialized
@@ -282,8 +296,11 @@ class BaseComponent(lifecycle.Node):
             config_dict = self.algorithms_config[algo_config_name]
             algo_config.from_dict(config_dict)
         elif self._config_file:
-            # configure directly from YAML if available
-            algo_config.from_yaml(self._config_file, nested_root_name=f"{self.node_name}.{algo_config_name.partition('Config')[0]}")
+            # configure directly from file if available
+            algo_config.from_file(
+                self._config_file,
+                nested_root_name=f"{self.node_name}.{algo_config_name.partition('Config')[0]}",
+            )
         return algo_config
 
     # Managing Inputs/Outputs
@@ -438,14 +455,14 @@ class BaseComponent(lifecycle.Node):
 
     def configure(self, config_file: Optional[str] = None):
         """
-        Configure component from yaml file
+        Configure component from configuration file
 
-        :param config_file: Path to file
+        :param config_file: Path to file with configuration (yaml, json or toml), defaults to None
         :type config_file: str
         """
         config_file = config_file or self._config_file
         if config_file:
-            self.config_from_yaml(config_file)
+            self.config_from_file(config_file)
 
         # Init any global node variables
         self.init_variables()
@@ -531,6 +548,16 @@ class BaseComponent(lifecycle.Node):
         """
         Services creation
         """
+        if (
+            not hasattr(self, "_maintain_default_services")
+            or not self._maintain_default_services
+        ):
+            # Default services were not maintained during a restart or never created
+            self._create_default_services()
+        if hasattr(self, "_maintain_default_services"):
+            # Reset the flag
+            self._maintain_default_services = False
+
         if self.run_type != ComponentRunType.SERVER:
             return
         if not self.service_type:
@@ -596,6 +623,13 @@ class BaseComponent(lifecycle.Node):
         # Destroy node main Server if runtype is server
         if self.run_type == ComponentRunType.SERVER:
             self.destroy_service(self.server)
+        if (
+            hasattr(self, "_maintain_default_services")
+            and self._maintain_default_services
+        ):
+            # Do not destroy default services
+            return
+
         for srv in self._default_services:
             self.destroy_service(srv)
 
@@ -604,7 +638,9 @@ class BaseComponent(lifecycle.Node):
         Destroys all action servers
         """
         # Destroy node main Server if runtype is action server
-        if self.run_type == ComponentRunType.ACTION_SERVER and hasattr(self, "action_server"):
+        if self.run_type == ComponentRunType.ACTION_SERVER and hasattr(
+            self, "action_server"
+        ):
             self.action_server.destroy()
 
     def destroy_all_action_clients(self):
@@ -617,25 +653,37 @@ class BaseComponent(lifecycle.Node):
         """destroy_all_service_clients."""
         pass
 
-    def config_from_yaml(self, config_file: str):
+    def config_from_file(self, config_file: str):
         """
-        Configure component from yaml file
+        Configure component from file
 
-        :param config_file: Path to file
+        :param config_file: Path to configuration file (yaml, json or toml)
         :type config_file: str
         """
-        self.config.from_yaml(
+        self.config.from_file(
             config_file, nested_root_name=self.node_name, get_common=True
         )
-        # Update algorithms config from Yaml
+        # Update algorithms config from file
         if self.algorithms_config:
-            # Load the YAML file
-            raw_config = OmegaConf.load(config_file)
-            for algo_name, algo_conf in self._algorithms_config.items():
-                config = OmegaConf.select(
-                    raw_config, f"{self.node_name}.{algo_name.partition('Config')[0]}"
-                )
+            # Load the file
+            ext: str = os.path.splitext(config_file)[1].lower()
 
+            with open(config_file, "r", encoding="utf-8") as f:
+                if ext in [".yaml", ".yml"]:
+                    raw_config: Dict[str, Any] = yaml.safe_load(f)
+                elif ext == ".json":
+                    raw_config = json.load(f)
+                elif ext == ".toml":
+                    raw_config = toml.load(f)
+                else:
+                    raise ValueError(f"Unsupported config format: {ext}")
+
+            for algo_name, algo_conf in self._algorithms_config.items():
+                config = raw_config
+                for key in [self.node_name, algo_name.partition("Config")[0]]:
+                    config = config.get(key, {})
+                if not config:
+                    continue
                 for item_key in algo_conf.keys():
                     if hasattr(config, item_key):
                         algo_conf[item_key] = getattr(config, item_key)
@@ -683,7 +731,6 @@ class BaseComponent(lifecycle.Node):
         """
         if not self.__events or not self.__actions:
             return
-
         self.__event_listeners = []
         for event, actions in zip(self.__events, self.__actions):
             # Register action to event callback to get executed on trigger
@@ -1198,6 +1245,7 @@ class BaseComponent(lifecycle.Node):
         :return: ACCEPT
         :rtype: rclpy.action.GoalResponse
         """
+        # Cancel any ongoing action
         self.get_logger().info("Received goal request")
         return GoalResponse.ACCEPT
 
@@ -1205,8 +1253,14 @@ class BaseComponent(lifecycle.Node):
         """
         Main component action server callback when handle is accepted
         """
-        self.get_logger().info("Goal accepted")
-        goal_handle.execute()
+        with self._main_goal_lock:
+            if self._main_goal_handle is not None and self._main_goal_handle.is_active:
+                # Abort the existing goal
+                self.get_logger().info("Aborting previous goal")
+                self._main_goal_handle.abort()
+            self._main_goal_handle = goal_handle
+            self.get_logger().info("Goal accepted")
+            self._main_goal_handle.execute()
 
     def _main_action_cancel_callback(self, _):
         """Main component action server callback when handle is canceled
@@ -1287,9 +1341,9 @@ class BaseComponent(lifecycle.Node):
                 callback_group=MutuallyExclusiveCallbackGroup(),
             ),
             self.create_service(
-                srv_type=ConfigureFromYaml,
-                srv_name=f"{self.get_name()}/configure_from_yaml",
-                callback=self._configure_from_yaml_srv_callback,
+                srv_type=ConfigureFromFile,
+                srv_name=f"{self.get_name()}/configure_from_file",
+                callback=self._configure_from_file_srv_callback,
                 callback_group=MutuallyExclusiveCallbackGroup(),
             ),
             # Run component method
@@ -1303,18 +1357,18 @@ class BaseComponent(lifecycle.Node):
 
     # EVENTS/ACTIONS RELATED SERVICES
     @log_srv
-    def _configure_from_yaml_srv_callback(
-        self, request: ConfigureFromYaml.Request, response: ConfigureFromYaml.Response
-    ) -> ConfigureFromYaml.Response:
+    def _configure_from_file_srv_callback(
+        self, request: ConfigureFromFile.Request, response: ConfigureFromFile.Response
+    ) -> ConfigureFromFile.Response:
         """
-        Configure the component from yaml service callback
+        Configure the component from file service callback
 
         :param request: _description_
-        :type request: ConfigureFromYaml.Request
+        :type request: ConfigureFromFile.Request
         :param response: _description_
-        :type response: ConfigureFromYaml.Response
+        :type response: ConfigureFromFile.Response
         :return: _description_
-        :rtype: ConfigureFromYaml.Response
+        :rtype: ConfigureFromFile.Response
         """
         try:
             # Reconfigure and restart the node
@@ -1412,6 +1466,8 @@ class BaseComponent(lifecycle.Node):
         keep_alive = request.keep_alive
 
         if not keep_alive:
+            # Set the flag so the default services are not destroyed or re-created
+            self._maintain_default_services = True
             # Stop the component
             self.stop()
 
@@ -1419,15 +1475,21 @@ class BaseComponent(lifecycle.Node):
             param_name, param_str_value
         )
 
+        if not keep_alive:
+            # start again
+            self.start()
+
         if not error_msg:
             response.success = True
         else:
             response.success = False
             response.error_msg = error_msg
 
-        if not keep_alive:
-            # start again
-            self.start()
+        while not self.lifecycle_state == 3:
+            self.get_logger().warn(
+                f"Component {self.node_name} is not in ACTIVE state. Waiting for it to become active again.",
+                once=True,
+            )
 
         return response
 
@@ -1452,6 +1514,8 @@ class BaseComponent(lifecycle.Node):
         keep_alive = request.keep_alive
 
         if not keep_alive:
+            # Set the flag so the default services are not destroyed or re-created
+            self._maintain_default_services = True
             # Stop the component
             self.stop()
 
@@ -1772,7 +1836,23 @@ class BaseComponent(lifecycle.Node):
         """
         return get_methods_with_decorator(self, decorator_name="component_action")
 
-    @component_action
+    def __wait_for_node_start(self) -> bool:
+        """Executes a waiting loop until the node is discoverable in ROS
+
+        :return: If node is active
+        :rtype: bool
+        """
+        timeout = 0.0
+        # Wait until node is actually up and active
+        while timeout < self.config.wait_for_restart_time:
+            all_nodes = self.get_node_names()
+            if self.node_name in all_nodes:
+                self.get_logger().info(f"Node {self.node_name} is successfully started")
+                break
+            time.sleep(1 / self.config.loop_rate)
+            timeout += 1 / self.config.loop_rate
+        return timeout < self.config.wait_for_restart_time
+
     def start(self) -> bool:
         """
         Start the component - trigger_activate
@@ -1795,11 +1875,11 @@ class BaseComponent(lifecycle.Node):
                 "Waiting for ongoing transition to end before executing new transition",
                 once=True,
             )
-            pass
 
         # configured and inactive
         self.trigger_activate()
-        return True
+
+        return self.__wait_for_node_start()
 
     @component_action
     def stop(self) -> bool:
@@ -1809,20 +1889,24 @@ class BaseComponent(lifecycle.Node):
         :return: If the component is stopped
         :rtype: bool
         """
-        current_state = self.lifecycle_state
-
-        if current_state in [1, 2, 4]:
+        if self.lifecycle_state in [1, 2, 4]:
             # Already not active
             return True
 
-        while current_state > 4:
+        while self.lifecycle_state > 4:
             self.get_logger().warn(
                 "Waiting for ongoing transition to end before executing new transition",
                 once=True,
             )
-            pass
 
         self.trigger_deactivate()
+
+        while self.lifecycle_state not in [1, 2, 4]:
+            self.get_logger().warn(
+                "Waiting for node to be completely stopped",
+                once=True,
+            )
+
         return True
 
     @component_action
@@ -1865,13 +1949,14 @@ class BaseComponent(lifecycle.Node):
                 "Waiting for ongoing transition to end before executing new transition",
                 once=True,
             )
-            pass
 
         # configure and go to configure (or active if the component was already active)
         self.trigger_configure()
 
         if initial_state >= 3:
             self.trigger_activate()
+            return self.__wait_for_node_start()
+
         return True
 
     @component_action
@@ -1895,7 +1980,6 @@ class BaseComponent(lifecycle.Node):
                 "Waiting for ongoing transition to end before executing new transition",
                 once=True,
             )
-            pass
 
         if wait_time:
             self.get_logger().warn(
@@ -1905,7 +1989,7 @@ class BaseComponent(lifecycle.Node):
 
         # not configured -> configure and start
         self.trigger_activate()
-        return True
+        return self.__wait_for_node_start()
 
     @component_action
     def set_param(
@@ -2149,7 +2233,8 @@ class BaseComponent(lifecycle.Node):
         Component fallback defined to only broadcast the current state so it is handled by an external manager.
         Used as the default fallback strategy for any system (external) failure
         """
-        if hasattr(self, "health_status_publisher"):
+        # If node is active publish status
+        if hasattr(self, "health_status_publisher") and self.lifecycle_state == 3:
             self.health_status_publisher.publish(self.health_status())
 
     # LIFECYCLE ON TRANSITIONS CUSTOM METHODS
@@ -2254,13 +2339,13 @@ class BaseComponent(lifecycle.Node):
         :rtype: lifecycle.TransitionCallbackReturn
         """
         try:
+            self.destroy_timer(self.__fallbacks_check_timer)
             self.deactivate()
             # Declare transition
             self.get_logger().info(
                 f"Node '{self.get_name()}' is in state '{state.label}'. Transitioning to 'inactive'"
             )
 
-            self.destroy_timer(self.__fallbacks_check_timer)
             self.health_status.set_healthy()
 
             # Call custom method
@@ -2380,3 +2465,75 @@ class BaseComponent(lifecycle.Node):
         Method called on cleanup to overwrite with custom cleanup
         """
         pass
+
+    # NOTE: The following two methods added to add the fix from https://github.com/ros2/rclpy/pull/1319 merged into rolling on Dec 13, 2024. To be removed once backported to iron/humble/jazzy
+    def __execute_transition_callback(
+        self, current_state_id: int, previous_state: LifecycleState
+    ) -> TransitionCallbackReturn:
+        cb = self._callbacks.get(current_state_id, None)
+        if cb is None:
+            return TransitionCallbackReturn.SUCCESS
+        try:
+            ret = cb(previous_state)
+            return ret
+        except Exception as e:
+            self.get_logger().error(f"Error executing state transition callback: {e}")
+            return TransitionCallbackReturn.ERROR
+
+    def _LifecycleNodeMixin__on_change_state(self, req, resp):
+        """
+        Overrides LifecycleNode ___on_change_state to avoid raising rcl_lifecycle error when 'change_state" service fails which otherwise would kill the process
+
+        :param req: Lifecycle change state request
+        :type req: lifecycle_msgs.srv.ChangeState.Request
+        :param resp: Lifecycle change state response
+        :type resp: lifecycle_msgs.srv.ChangeState.Response
+
+        """
+        # Check if node is initialized
+        if not self._state_machine.initialized:
+            self.get_logger().error(
+                "Internal error: got service request while lifecycle state machine is not initialized."
+            )
+            resp.success = False
+            return resp
+
+        transition_id = req.transition.id
+
+        # modification
+        available_transition_ids = [
+            t[0] for t in self._state_machine.available_transitions
+        ]
+        self.get_logger().debug(
+            f"Available transitions for {self.node_name}: {available_transition_ids}, Requested {transition_id}"
+        )
+
+        if transition_id not in available_transition_ids:
+            self.get_logger().warn(
+                f"Invalid transition requested for for node {self.node_name}."
+            )
+            resp.success = False
+            return resp
+
+        initial_state = self._state_machine.current_state
+        initial_state = LifecycleState(
+            state_id=initial_state[0], label=initial_state[1]
+        )
+        self._state_machine.trigger_transition_by_id(transition_id, True)
+
+        cb_return_code = self.__execute_transition_callback(
+            self._state_machine.current_state[0], initial_state
+        )
+        self._state_machine.trigger_transition_by_label(cb_return_code.to_label(), True)
+
+        if cb_return_code == TransitionCallbackReturn.ERROR:
+            # Now we're in the errorprocessing state, trigger the on_error callback
+            # and transition again based on the return code.
+            error_cb_ret_code = self.__execute_transition_callback(
+                self._state_machine.current_state[0], initial_state
+            )
+            self._state_machine.trigger_transition_by_label(
+                error_cb_ret_code.to_label(), True
+            )
+        resp.success = cb_return_code == TransitionCallbackReturn.SUCCESS
+        return resp
