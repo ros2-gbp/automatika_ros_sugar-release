@@ -5,6 +5,8 @@
 </picture>
 <br/><br/>
 
+🇨🇳 [简体中文](docs/README.zh.md) | 🇯🇵 [日本語](docs/README.ja.md)
+
 Sugarcoat 🍬 is a meta-framework that provides a whole lot of syntactic sugar for creating event-driven multinode systems in ROS2, using an intuitive Python API.
 
 - Learn more about the [**design concepts**](https://automatika-robotics.github.io/sugarcoat/design/index.html) in Sugarcoat 📚
@@ -43,27 +45,25 @@ A [Component](https://automatika-robotics.github.io/sugarcoat/design/component.h
 
 ## Installation
 
-Install python dependencies using pip as follows:
-
-`pip install 'attrs>=23.2.0' numpy-quaternion`
-
-For ROS versions >= 'jazzy', you can install Sugarcoat with your package manager. For example on Ubuntu:
+For ROS versions >= _humble_, you can install Sugarcoat with your package manager. For example on Ubuntu:
 
 `sudo apt install ros-$ROS_DISTRO-automatika-ros-sugar`
 
-Alternatively, for older versions of ROS2 grab your favorite deb package from the [release page](https://github.com/automatika-robotics/sugarcoat/releases) and install it as follows:
+Alternatively, grab your favorite deb package from the [release page](https://github.com/automatika-robotics/sugarcoat/releases) and install it as follows:
 
 `sudo dpkg -i ros-$ROS_DISTRO-automatica-ros-sugar_$version$DISTRO_$ARCHITECTURE.deb`
 
-## Building from source
+If the attrs version from your package manager is < 23.2, install it using pip as follows:
 
-l
+`pip install 'attrs>=23.2.0'`
+
+## Building from source
 
 ```shell
 mkdir -p ros-sugar-ws/src
 cd ros-sugar-ws/src
 git clone https://github.com/automatika-robotics/sugarcoat && cd ..
-pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 msgpack msgpack-numpy numpy-quaternion setproctitle pyyaml toml
+pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 msgpack msgpack-numpy setproctitle pyyaml toml
 colcon build
 source install/setup.bash
 ```
