@@ -2,6 +2,55 @@
 Changelog for package automatika_ros_sugar
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.3.1 (2025-06-28)
+------------------
+* (refactor) Corrects type hint in callbacks
+* (refactor) Adds type hints to validators
+* (refactor) Minor improvements and typo correction
+* (refactor) Resolves todo in component actions for active flag and adds default logger for module
+* (chore) Updates service creation script with better error handling
+* (docs) Updates installation instructions
+* (refactor) Removes numpy-quaternion from dependencies and implements rotations using numpy
+* (docs) Updates logo icon and adds 'config from file' page to docs
+* (fix) Adds wait for node activation after restart and fixes optional arguments parsing in Component
+* (docs) Updates events docs
+* (docs) Adds international readmes
+* (chore) Removes pip based test dependencies for ROS build farm
+* (docs) Updates readme
+* Contributors: ahr, mkabtoul
+
+0.3.0 (2025-06-18)
+------------------
+* (chore) Updates installation instructions and CI
+* (fix) Removes NoneType from types for compatibility with python < 3.10
+* (fix) Add missing pyyaml dependency
+* (feature) Adds config parsing from toml, json and yaml and removes Omegaconf dependency
+* (fix) Add missing action decorator to methods
+* (docs) Updates img names
+* (docs) Updates readme
+* (chore) Adds a sweeter name for ROS Sugar .. Sugarcoat
+* (docs) Minor edits
+* (docs) Adds documentation for creating systemd services with scripts
+* (docs) Fixes size of logo
+* (docs) Fixes warnings in docs
+* (docs) Minor fix
+* (docs) Updates supported types docs
+* (fix) Fixes minor typo
+* (fix) Fixes logging level parsing
+* (feature) Adds node logging level and rclpy logging level to component config
+* (fix) Adds BGR2RGB tranformation for yuv422_yuy2 encoding
+* (docs) Removes unused extension
+* (docs) Adds docs for components services and pkg advantages
+* Merge branch 'feature/system_management' of github.com:automatika-robotics/ros-sugar into feature/system_management
+* (fix) Fixes transformation quaternion parsing
+* (feature) Adds utility method for processing all ROS image encodings
+* (feature) Adds transformation/rotation propertires to TFListener
+* (fix) Fixes lifecycle transitioin callback in component
+* (chore) Adds msgpack-numpy and attrs as deb package dependencies
+* (fix) Handles lifecycle actions start/stop/restart from the launcher
+* (fix) Adds action goal lock to handle aborting ongoing goals and executing new incoming goals
+* Contributors: ahr, mkabtoul
+
 0.2.9 (2025-02-18)
 ------------------
 * (docs) Updates supported types docs and adds docstrings
