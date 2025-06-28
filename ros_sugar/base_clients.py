@@ -22,10 +22,10 @@ class ServiceClientConfig(BaseAttrs):
     srv_type: type = field()
     name: str = field()
     timeout_secs: float = field(
-        default=1.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
+        default=30.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
     )  # timeout after calling the service
     attempt_period_secs: float = field(
-        default=0.1, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
+        default=1.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
     )  # time period to attempt to call the service again
 
 
@@ -38,10 +38,10 @@ class ActionClientConfig(BaseAttrs):
     action_type: type = field()
     name: str = field()
     timeout_secs: float = field(
-        default=1.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
+        default=30.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
     )  # timeout after calling the action
     attempt_period_secs: float = field(
-        default=0.1, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
+        default=1.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
     )  # time period to attempt to call the action again
     feedback_check_period: float = field(
         default=0.05, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
@@ -201,7 +201,7 @@ class ActionClientHandler:
 
     def reset(self):
         """
-        Resst the client handler
+        Reset the client handler
         """
         self.old_feedback_count: int = -1
         self.feedback_count: int = 0
@@ -230,7 +230,7 @@ class ActionClientHandler:
         while not self.client.wait_for_server(
             timeout_sec=self.config.attempt_period_secs
         ):
-            self.node.get_logger().warning(
+            self.node.get_logger().info(
                 "Waiting for Server node to become available...", once=True
             )
 
@@ -262,7 +262,6 @@ class ActionClientHandler:
             self.node.get_logger().warn("Waiting for action feedback", once=True)
             if not self.got_new_feedback():
                 return False
-            pass
 
         # Add method when action is done
         self._send_goal_future.add_done_callback(self.action_response_callback)
@@ -300,8 +299,7 @@ class ActionClientHandler:
 
     def action_feedback_callback(self, feedback_msg: Any):
         """
-        Method to be called at each action feedback
-
+        Handles feedback messages received during action execution.
         :param feedback_msg: Action feedback message
         :type feedback_msg: Any
         """
