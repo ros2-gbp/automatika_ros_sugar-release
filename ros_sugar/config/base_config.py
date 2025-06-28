@@ -1,12 +1,17 @@
+"""Config Classes for Components and Topics"""
+
 from enum import Enum
 from typing import Union, Optional
 
 from attrs import define, field
 from rclpy import qos
 import rclpy.callback_groups as ros_callback_groups
+from rclpy.logging import LoggingSeverity
 
 from . import base_validators
 from .base_attrs import BaseAttrs
+
+__all__ = ["QoSConfig", "BaseComponentConfig", "BaseConfig", "ComponentRunType"]
 
 
 def _get_enum_value(enm_val):
@@ -196,6 +201,30 @@ def _convert_runtype_to_enum(
         raise ValueError(f"Unsupported ComponentRunTime value '{value}'")
 
 
+def _convert_logging_severity_to_str(
+    value: Union[LoggingSeverity, str],
+) -> str:
+    """
+    Converter for ComponentRunType to set the value from strings
+
+    :param value: Runtype value
+    :type value: Union[ComponentRunType, str]
+
+    :raises ValueError: If string value is not one of the ComponentRunType Enum values
+
+    :return: Enum value
+    :rtype: ComponentRunType
+    """
+    if isinstance(value, LoggingSeverity):
+        return value.name.lower()
+    if isinstance(value, str):
+        # Validate string value
+        for value_enum in LoggingSeverity:
+            if value_enum.name.lower() == value.lower():
+                return value
+        raise ValueError(f"Unsupported Logging Severity Value '{value}'")
+
+
 def _get_str_from_callbackgroup(
     callback_group: Union[str, ros_callback_groups.CallbackGroup],
 ) -> Optional[str]:
@@ -216,14 +245,26 @@ class BaseComponentConfig(BaseConfig):
     """
     Component configuration parameters
 
-    :param use_without_launcher: To use the component without the Launcher. When True it initializes a ROS node on component init
+    :param use_without_launcher: To use the component without the Launcher. When True, it initializes a ROS node on component init.
     :type use_without_launcher: bool
-    :param layer_id: Component layer ID. Refers to the component 'start' or 'activate' priority. Zero is equivalent to no-priority
-    :type layer_id: int
-    :param fallback_rate: Rate (Hz) in which the component checks for Fallbacks and executes actions if a failure is detected
+
+    :param fallback_rate: Rate (Hz) at which the component checks for fallbacks and executes actions if a failure is detected.
     :type fallback_rate: float
-    :param run_type: Component run type
-    :type run_type: ComponentRunType
+
+    :param log_level: Logging level for the component's internal logs. Can be a string or `LoggingSeverity` enum.
+    :type log_level: Union[str, LoggingSeverity]
+
+    :param rclpy_log_level: Logging level for rclpy (ROS client library) logs. Can be a string or `LoggingSeverity` enum.
+    :type rclpy_log_level: Union[str, LoggingSeverity]
+
+    :param run_type: Component run type, e.g., TIMED or EVENT. Can be a string or `ComponentRunType` enum.
+    :type run_type: Union[ComponentRunType, str]
+
+    :param _callback_group: (Optional) Callback group used by the component. Can be a string or `ros_callback_groups.CallbackGroup` instance.
+    :type _callback_group: Optional[Union[ros_callback_groups.CallbackGroup, str]]
+
+    :param wait_for_restart_time: Time (in seconds) the component waits for a node to come back online after restart. Used to avoid infinite restart loops. Recommended to use a high value.
+    :type wait_for_restart_time: float
     """
 
     use_without_launcher: bool = field(default=False)
@@ -237,6 +278,14 @@ class BaseComponentConfig(BaseConfig):
         default=100.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
     )
 
+    log_level: Union[str, LoggingSeverity] = field(
+        default=LoggingSeverity.INFO, converter=_convert_logging_severity_to_str
+    )
+
+    rclpy_log_level: Union[str, LoggingSeverity] = field(
+        default=LoggingSeverity.WARN, converter=_convert_logging_severity_to_str
+    )
+
     run_type: Union[ComponentRunType, str] = field(
         default=ComponentRunType.TIMED, converter=_convert_runtype_to_enum
     )
@@ -244,3 +293,8 @@ class BaseComponentConfig(BaseConfig):
     _callback_group: Optional[Union[ros_callback_groups.CallbackGroup, str]] = field(
         default=None, converter=_get_str_from_callbackgroup, alias="_callback_group"
     )
+
+    wait_for_restart_time: float = field(
+        default=6000.0,
+        validator=base_validators.in_range(min_value=10.0, max_value=1e9),
+    )  # Component wait time for node to come back online after restart (used to avoid infinite loops). Recommended to use a high value
