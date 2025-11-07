@@ -48,12 +48,7 @@ def _in_bool_element(topic_name: str, topic_type: str):
                     checked=False,
                     name="data",
                 ),
-                Button(
-                    "Send",
-                    type="submit",
-                    title="Send",
-                    cls="primary-button"
-                ),
+                Button("Send", type="submit", title="Send", cls="primary-button"),
                 cls="space-x-4 ml-2",
             ),
             id=f"{topic_name}-form",
@@ -202,9 +197,19 @@ def _in_pose_element(topic_name: str, topic_type: str):
     )
 
 
-def _out_image_element(topic_name: str):
+def _out_image_element(topic_name: str, **_):
     """FastHTML element for output Image/CompressedImage type"""
-    return DivCentered(Img(id=topic_name, name="video-frame", src="", cls="h-[40vh] w-auto"))
+    return DivCentered(
+        Img(id=topic_name, name="video-frame", src="", cls="h-[40vh] w-auto")
+    )
+
+
+def _log_audio_element(logging_card, output, data_src: str, id: str = "audio"):
+    return logging_card(_styled_logging_audio(output, data_src, id))
+
+
+def _log_text_element(logging_card, output, data_src: str, id: str = "text"):
+    return logging_card(_styled_logging_text(output, data_src, id))
 
 
 _INPUT_ELEMENTS: Dict = {
@@ -220,6 +225,11 @@ _INPUT_ELEMENTS: Dict = {
 }
 
 _OUTPUT_ELEMENTS: Dict = {
+    "String": _log_text_element,
+    "Float32": _log_text_element,
+    "Float64": _log_text_element,
+    "Bool": _log_text_element,
+    "Audio": _log_audio_element,
     "Image": _out_image_element,
     "CompressedImage": _out_image_element,
     "OccupancyGrid": _out_image_element,
@@ -517,27 +527,30 @@ def component_settings_div(
 
 
 LOG_STYLES = {
-    "alert": {"prefix": ">>>", "cls": f"{TextT.lg} text-green-500"},
-    "error": {"prefix": ">>> ERROR: ", "cls": f"{TextT.lg} text-red-500"},
-    "warn": {"prefix": ">>> WARNNING: ", "cls": f"{TextT.lg} text-orange-500"},
-    "user": {"prefix": "> User:", "cls": f"{TextT.medium} text-blue-400"},
+    "alert": {"prefix": ">>>", "cls": f"{TextT.lg} tomorrow-night-green"},
+    "error": {"prefix": ">>> ERROR: ", "cls": f"{TextT.lg} tomorrow-night-red"},
+    "warn": {"prefix": ">>> WARNNING: ", "cls": f"{TextT.lg} tomorrow-night-yellow"},
+    "user": {
+        "prefix": "> User:",
+        "cls": f"{TextT.medium} font-bold tomorrow-night-blue",
+    },
     "robot": {
         "prefix": "> Robot:",
-        "cls": f"{TextT.medium} font-bold text-purple-400",
+        "cls": f"{TextT.medium} font-bold tomorrow-night-green",
     },
 }
 # Default style for "info" or any other unspecified source
 DEFAULT_STYLE = {"prefix": ">", "cls": ""}
 
 
-def _styled_logging_text(text: str, output_src: str = "info"):
+def _styled_logging_text(text: str, output_src: str = "info", div_id: str = "text"):
     """Builds a styled text log component."""
-    container = Div(cls="whitespace-pre-wrap ml-2 p-2 flex items-start")
+    container = Div(cls="whitespace-pre-wrap ml-2 p-2 flex items-start", id=div_id)
     style = LOG_STYLES.get(output_src, DEFAULT_STYLE)
 
     if output_src in ["user", "robot"]:
         prefix_element = Strong(style["prefix"] + " ", cls=style["cls"])
-        content_element = P(prefix_element, f"{text}")
+        content_element = Span(prefix_element, f"{text}", id="inner-text")
         container(content_element)
     # All other types have the text inside the main Strong tag
     else:
@@ -550,9 +563,9 @@ def _styled_logging_text(text: str, output_src: str = "info"):
     return container
 
 
-def _styled_logging_audio(output, output_src: str = "info"):
+def _styled_logging_audio(output, output_src: str = "info", div_id: str = "audio"):
     """Builds a styled audio log component."""
-    container = DivLAligned(cls="whitespace-pre-wrap ml-2 p-2")
+    container = DivLAligned(cls="whitespace-pre-wrap ml-2 p-2", id=div_id)
     style = LOG_STYLES.get(output_src, DEFAULT_STYLE)
 
     audio_element = Audio(
@@ -576,6 +589,7 @@ def output_logging_card(current_log):
             cls="space-x-0",
         ),
         cls="fix-size draggable main-card h-[60vh] max-h-[60vh]",
+        id="logging-card-parent",
     )
 
 
@@ -597,20 +611,47 @@ def remove_child_from_logging_card(logging_card, target_id="loading-dots"):
             break
 
 
+def augment_text_in_logging_card(
+    logging_card,
+    new_txt: str,
+    target_id="text",
+):
+    """Update the inner text of a child in logging_card.children with a matching id."""
+    children = logging_card.children
+    target_child = None
+    for i in range(len(children) - 1, -1, -1):
+        if getattr(children[i], "id", None) == target_id:
+            target_child = children[i]
+            break
+    if not target_child:
+        return logging_card
+    # Update inner text
+    for i in range(len(target_child.children) - 1, -1, -1):
+        if getattr(target_child.children[i], "id", None) == "inner-text":
+            # Append the new text
+            target_child.children[i](Span(f"{new_txt}"))
+            return logging_card
+    return logging_card
+
+
 def update_logging_card(
-    logging_card, output: str, output_src: str = "info", is_audio: bool = False
+    logging_card, output: str, data_type: str, data_src: str = "info"
 ):
     remove_child_from_logging_card(logging_card)
-    if is_audio:
-        return logging_card(_styled_logging_audio(output, output_src))
-    return logging_card(_styled_logging_text(output, output_src))
+    # Handle errors originating from ROS node
+    if data_type == "error":
+        data_type = "String"
+        data_src = "error"
+    return _OUTPUT_ELEMENTS[data_type](logging_card, output, data_src)
 
 
 def update_logging_card_with_loading(logging_card):
     """Update logging card"""
     return logging_card(
         Div(
-            Strong("> Robot:", cls=f"{TextT.medium} font-bold text-purple-400 mr-2"),
+            Strong(
+                "> Robot:", cls=f"{TextT.medium} font-bold tomorrow-night-green mr-2"
+            ),
             Loading(cls=(LoadingT.dots, LoadingT.md)),
             cls="whitespace-pre-wrap ml-2 p-2 flex items-start",
             id="loading-dots",
