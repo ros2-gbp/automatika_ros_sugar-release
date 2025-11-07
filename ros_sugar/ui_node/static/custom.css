@@ -1,4 +1,39 @@
-@import url("https://fonts.googleapis.com/css2?family=Titillium+Web:wght@300;400;600;700&display=swap");
+/* Titillium Web" Font - Self-hosted version */
+@font-face {
+    font-family: "Titillium Web";
+    src: url("/fonts/TitilliumWeb/TitilliumWeb-Light.woff2") format("woff2"),
+        url("/fonts/TitilliumWeb/TitilliumWeb-Light.woff") format("woff");
+    font-weight: 300;
+    font-style: normal;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: "Titillium Web";
+    src: url("/fonts/TitilliumWeb/TitilliumWeb-Regular.woff2") format("woff2"),
+        url("/fonts/TitilliumWeb/TitilliumWeb-Regular.woff") format("woff");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: "Titillium Web";
+    src: url("/fonts/TitilliumWeb/TitilliumWeb-SemiBold.woff2") format("woff2"),
+        url("/fonts/TitilliumWeb/TitilliumWeb-SemiBold.woff") format("woff");
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: "Titillium Web";
+    src: url("/fonts/TitilliumWeb/TitilliumWeb-Bold.woff2") format("woff2"),
+        url("/fonts/TitilliumWeb/TitilliumWeb-Bold.woff") format("woff");
+    font-weight: 700;
+    font-style: normal;
+    font-display: swap;
+}
 
 :root {
     /* Color Palette */
@@ -234,4 +269,36 @@ body {
     font-size: 0.95rem;
 }
 
+/* Tomorrow Night Updated Color Palette */
+.tomorrow-night-black {
+    color: #666666;
+}
+
+.tomorrow-night-blue {
+    color: #8db7dc;
+}
+
+.tomorrow-night-cyan {
+    color: #7ecdc3;
+}
+
+.tomorrow-night-green {
+    color: #74c16a;
+}
+
+.tomorrow-night-magenta {
+    color: #c397d8;
+}
+
+.tomorrow-night-red {
+    color: #d54e53;
+}
+
+.tomorrow-night-white {
+    color: #eaeaea;
+}
+
+.tomorrow-night-yellow {
+    color: #f0c674;
+}
 
