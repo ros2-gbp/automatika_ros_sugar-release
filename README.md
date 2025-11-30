@@ -1,3 +1,26 @@
+## automatika_ros_sugar (rolling) - 0.4.2-1
+
+The packages in the `automatika_ros_sugar` repository were released into the `rolling` distro by running `/home/ahr/.venv/bin/bloom-release --rosdistro rolling automatika_ros_sugar` on `Sun, 30 Nov 2025 14:23:18 -0000`
+
+The `automatika_ros_sugar` package was released.
+
+Version of package(s) in repository `automatika_ros_sugar`:
+
+- upstream repository: https://github.com/automatika-robotics/ros-sugar.git
+- release repository: https://github.com/ros2-gbp/automatika_ros_sugar-release.git
+- rosdistro version: `0.4.1-1`
+- old version: `0.4.1-1`
+- new version: `0.4.2-1`
+
+Versions of tools used:
+
+- bloom version: `0.13.0`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## automatika_ros_sugar (kilted) - 0.4.2-1
 
 The packages in the `automatika_ros_sugar` repository were released into the `kilted` distro by running `/home/ahr/.venv/bin/bloom-release --rosdistro kilted automatika_ros_sugar` on `Sun, 30 Nov 2025 14:15:46 -0000`
