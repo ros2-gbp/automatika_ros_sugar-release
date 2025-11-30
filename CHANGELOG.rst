@@ -2,6 +2,15 @@
 Changelog for package automatika_ros_sugar
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.4.2 (2025-11-30)
+------------------
+* (docs) Adds robot plugins tutorial to docs
+* (feature) Adds publish pre processors to robot plugin client
+* (feature) Adds robot plugin client and enable using plugins in components and launcher
+* (fix) Fixes publishing occupancy grid (humble)
+* (fix) Fixes conversion between Vector3 and Point
+* Contributors: ahr, mkabtoul
+
 0.4.1 (2025-11-07)
 ------------------
 * (feature) Adds UI font files locally
