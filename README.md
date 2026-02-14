@@ -1,3 +1,26 @@
+## automatika_ros_sugar (jazzy) - 0.5.0-1
+
+The packages in the `automatika_ros_sugar` repository were released into the `jazzy` distro by running `/usr/bin/bloom-release --rosdistro jazzy automatika_ros_sugar` on `Sat, 14 Feb 2026 15:20:34 -0000`
+
+The `automatika_ros_sugar` package was released.
+
+Version of package(s) in repository `automatika_ros_sugar`:
+
+- upstream repository: https://github.com/automatika-robotics/ros-sugar.git
+- release repository: https://github.com/ros2-gbp/automatika_ros_sugar-release.git
+- rosdistro version: `0.4.3-1`
+- old version: `0.4.3-1`
+- new version: `0.5.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.13.0`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## automatika_ros_sugar (humble) - 0.5.0-1
 
 The packages in the `automatika_ros_sugar` repository were released into the `humble` distro by running `/usr/bin/bloom-release --rosdistro humble automatika_ros_sugar` on `Sat, 14 Feb 2026 15:16:23 -0000`
