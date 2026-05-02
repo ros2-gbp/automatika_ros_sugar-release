@@ -8,6 +8,7 @@ import toml
 import socket
 from abc import abstractmethod
 from copy import deepcopy
+from contextlib import contextmanager
 import threading
 from typing import Any, Dict, List, Optional, Union, Callable, Sequence, Tuple, Type
 from functools import wraps, partial
@@ -298,11 +299,11 @@ class BaseComponent(lifecycle.Node):
 
                 if isinstance(plugin_value, Topic):
                     if topic.name != plugin_value.name:
-                        self.get_logger().warn(
+                        self.get_logger().warning(
                             f"Input Topic is given with name '{topic.name}' ({msg_type_name}), "
                             f"but robot plugin provides default name '{plugin_value.name}' ({plugin_value.msg_type.__name__})."
                         )
-                        self.get_logger().warn(
+                        self.get_logger().warning(
                             f"Robot Plugin Topic Name will be Used! To change it, replace the name in '{self.config._robot_plugin}'"
                         )
                     self._replace_input_topic(
@@ -317,11 +318,11 @@ class BaseComponent(lifecycle.Node):
 
                 if isinstance(plugin_value, Topic):
                     if topic.name != plugin_value.name:
-                        self.get_logger().warn(
+                        self.get_logger().warning(
                             f"Input Topic is given with name '{topic.name}' ({msg_type_name}), "
                             f"but robot plugin provides default name '{plugin_value.name}' ({plugin_value.msg_type.__name__})."
                         )
-                        self.get_logger().warn(
+                        self.get_logger().warning(
                             f"Robot Plugin Topic Name will be Used! To change it, replace the name in '{self.config._robot_plugin}'"
                         )
                     self._replace_output_topic(
@@ -877,7 +878,9 @@ class BaseComponent(lifecycle.Node):
         transform_listener = TransformListener(buffer=tf_handler.tf_buffer, node=self)
         tf_handler.set_listener(transform_listener)
         transform_timer = self.create_timer(
-            1 / tf_config.lookup_rate, tf_handler.timer_callback
+            1 / tf_config.lookup_rate,
+            tf_handler.timer_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
         )  # timer to lookup the transform with given rate
         tf_handler.timer = transform_timer
         return tf_handler
@@ -1611,7 +1614,7 @@ class BaseComponent(lifecycle.Node):
         :return: _description_
         :rtype: _type_
         """
-        self.get_logger().warn("Received cancel request")
+        self.get_logger().warning("Received cancel request")
         try:
             return CancelResponse.ACCEPT
         except Exception as e:
@@ -1836,7 +1839,7 @@ class BaseComponent(lifecycle.Node):
         while self.lifecycle_state != LifecycleStateMsg.PRIMARY_STATE_ACTIVE and (
             timeout_counter < self.config.wait_for_restart_time
         ):
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Component {self.node_name} is not in ACTIVE state. Waiting for it to become active again.",
                 once=True,
             )
@@ -1983,7 +1986,7 @@ class BaseComponent(lifecycle.Node):
             self.in_topics.pop(idx)
             self.in_topics.insert(idx, new_topic)
         except ValueError:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Old topic {old_topic.name} not found in self.in_topics. "
                 "Updating callbacks anyway."
             )
@@ -2050,7 +2053,7 @@ class BaseComponent(lifecycle.Node):
             self.out_topics.pop(idx)
             self.out_topics.insert(idx, new_topic)
         except ValueError:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Old topic {old_topic.name} not found in self.out_topics. "
                 "Updating publisher dictionary anyway."
             )
@@ -2148,20 +2151,34 @@ class BaseComponent(lifecycle.Node):
                 response.error_msg = (
                     f"Expecting json style keyword arguments, got {request.kwargs_json}"
                 )
-                self.get_logger().warn(f"Error parsing request parameters: {e}")
+                self.get_logger().warning(f"Error parsing request parameters: {e}")
                 return response
         try:
             method = getattr(self, request.name)
             result = method(**kwargs)
-            if result is not None and isinstance(result, bool):
+            if isinstance(result, bool):
                 response.success = result
+                # TODO: If the error is caught in the method and it returns false
+                # we consider this a failure. This is for backward compatibility
+                # Thus component actions cannot return False as a legitimate
+                # response. We should ensure all component actions in downstream
+                # packages are modified before changing this behaviour.
                 if not result:
                     response.error_msg = f"The method '{request.name}' executed but returned False, indicating failure without an exception."
-            elif result is not None and isinstance(result, str):
+                else:
+                    response.response_json = json.dumps(result)
+            # NOTE: empty responses are considered successful
+            elif result is None:
                 response.success = True
-                response.error_msg = f"The method '{request.name}' executed and returned the following string: {result}"
             else:
                 response.success = True
+                try:
+                    response.response_json = json.dumps(result)
+                except (TypeError, ValueError) as e:
+                    response.response_json = ""
+                    response.error_msg = (
+                        f"The method '{request.name}' returned a value that is not JSON serializable: {e}"
+                    )
         except Exception as e:
             response.success = False
             response.error_msg = f"Component {self.node_name} has a method with requested name '{request.name}' but the following error raised while running: {e}"
@@ -2331,7 +2348,7 @@ class BaseComponent(lifecycle.Node):
         while (
             self.lifecycle_state >= LifecycleStateMsg.TRANSITION_STATE_CONFIGURING
         ) and (timeout_counter < self.config._lifecycle_state_transition_timeout):
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "Waiting for ongoing transition to end before executing new transition",
                 once=True,
             )
@@ -2413,7 +2430,7 @@ class BaseComponent(lifecycle.Node):
         :return: If the component is Reconfigured
         :rtype: bool
         """
-        self.get_logger().warn("Reconfiguring component...")
+        self.get_logger().warning("Reconfiguring component...")
 
         if keep_alive:
             # set new config as params attr
@@ -2478,7 +2495,7 @@ class BaseComponent(lifecycle.Node):
             return False
 
         if wait_time:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Waiting for requested time '{wait_time}'seconds before starting again...",
             )
             time.sleep(wait_time)
@@ -2583,7 +2600,7 @@ class BaseComponent(lifecycle.Node):
                 self.health_status.is_algorithm_fail
                 and self.__fallbacks.on_algorithm_fail
             ):
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "Algorithm Failure Detected -> Executing Fallback ..."
                 )
                 self.__fallbacks_giveup = self.__fallbacks.execute_algorithm_fallback()
@@ -2592,13 +2609,13 @@ class BaseComponent(lifecycle.Node):
                 self.health_status.is_component_fail
                 and self.__fallbacks.on_component_fail
             ):
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "Component Failure Detected -> Executing Fallback ..."
                 )
                 self.__fallbacks_giveup = self.__fallbacks.execute_component_fallback()
 
             elif self.health_status.is_system_fail and self.__fallbacks.on_system_fail:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "System Failure Detected -> Executing Fallback ..."
                 )
                 self.__fallbacks_giveup = self.__fallbacks.execute_system_fallback()
@@ -2611,7 +2628,7 @@ class BaseComponent(lifecycle.Node):
 
         except ValueError:
             # ValueError is thrown when no fallbacks are defined for detected failure
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "No fallback policy is defined for detected failure -> Failure is broadcasted"
             )
 
@@ -2979,6 +2996,34 @@ class BaseComponent(lifecycle.Node):
 
         return super().on_error(state)
 
+    @contextmanager
+    def safe_restart(self):
+        """Stop the component, yield for operations, then restart and wait for ACTIVE state."""
+        self._maintain_default_services = True
+
+        try:
+            self.stop()
+            self.trigger_cleanup()
+            yield
+        finally:
+            self.start()
+
+            timeout_counter = 0
+            while self.lifecycle_state != LifecycleStateMsg.PRIMARY_STATE_ACTIVE and (
+                timeout_counter < self.config.wait_for_restart_time
+            ):
+                self.get_logger().warning(
+                    f"Component {self.node_name} is not in ACTIVE state. Waiting for it to become active again.",
+                    once=True,
+                )
+                # NOTE: Callbacks will not fire during this sleep
+                time.sleep(1 / self.config.loop_rate)
+                timeout_counter += 1 / self.config.loop_rate
+
+            if self.lifecycle_state != LifecycleStateMsg.PRIMARY_STATE_ACTIVE:
+                self.health_status.set_fail_component()
+                raise RuntimeError("Error restarting the component")
+
     def custom_on_configure(self) -> None:
         """
         Method called on configure to overwrite with custom configuration
@@ -3059,7 +3104,7 @@ class BaseComponent(lifecycle.Node):
         )
 
         if transition_id not in available_transition_ids:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Invalid transition requested for for node {self.node_name}."
             )
             resp.success = False
