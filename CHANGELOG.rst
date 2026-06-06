@@ -2,6 +2,53 @@
 Changelog for package automatika_ros_sugar
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.1 (2026-06-05)
+------------------
+* (fix) Fixes stale reference in logged warning
+* (chore) Adds more tests for plugins, http transport, route via host and telemetry bus
+* (refactor) Changes from tcp to AF_UNIX sockets in transport bus and fixes pubilishing from multiple threads on the same sock via locks
+* (fix) Makes rclpy_context test fixture tolerant of a pre-initialized context
+* (docs) Updates robot plugins doc
+* (feature) Adds robot config from plugin when defined
+* (fix) Adds handling callbacks and publishers dict as sources of truth instead of in_topic and out_topic
+* (chore) Adds correct docstring for plugin metadata
+* (chore) Updates robot plugin tests
+* (feature) Adds use_plugin to topic to get take topic type from plugin
+  - Disambiguates topics of similar type by matching topic name with keys
+  available in plugin
+  - Keys can surface in errors or avaialble via inspection
+* (feature) Adds plugin_action decorator for robot actions exposed by plugins
+* (chore) Adds test for robot plugin feature
+* (feature) Adds initialization and tear down of robot plugin host to the launcher
+* (feature) Adds serialization of robot plugin in the generic executable
+* (feature) Adds handling of external plugin topics and events blackboard in the monitor
+* (feature) Wires the robot plugin handling in the component
+* (feature) Adds robot command type that subclasses publisher for generalized publishing to robot via plugins
+* (refactor) Removes old plugin init from serialized config
+* (feautre) Adds new general purpose robot plugin infrastructure (feedback, robot commands, transports and plugin classes)
+* (chore) Removes rolling from deb package build
+* Contributors: ahr
+
+0.7.0 (2026-04-30)
+------------------
+* (chore) Adds tests for base attrs
+* (fix) Adds check for any type fields in base attrs
+* (feature) Adds display of action server logs in the main logging card (`#46 <https://github.com/automatika-robotics/sugarcoat/issues/46>`_)
+* (fix) Changes sleep time between probe service response checks to 1/loop_rate instead of arbitrary constant
+* (feature) Adds on_process_fail method to launcher that respawns processes
+  - Adds lifecycle service calling methods in monitor to respawn processes and handle lifecylce transitions
+  - Creates unified timer for watching process start for initial launch and failed process launch
+  - Uses internal launch actions for emitting the action to launch all components at init
+* (fix) Adds a param to base config for executor spin timeout to decouple it from loop rate
+* (feature) Adds ui display for geometry types when no map element is present
+* (fix) Specifies callback in tf listener timer (`#43 <https://github.com/automatika-robotics/sugarcoat/issues/43>`_)
+* (chore) Adds testing for execute action service
+* (feature) Calling the execute method service for component actions now returns the method response
+* (chore) Adds testing CI
+* (chore) Adds test for safe restart
+* (feature) Adds the safe restart context manager in base component
+* Contributors: Maria Kabtoul, ahr, mkabtoul
+
 0.6.1 (2026-04-11)
 ------------------
 * (docs) Adds a more comprehensive guide for the internal events-actions system design
