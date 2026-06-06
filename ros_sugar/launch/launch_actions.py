@@ -10,7 +10,6 @@ from launch_ros.actions import Node as NodeLaunchAction
 from rclpy.context import Context
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.impl.logging_severity import LoggingSeverity
-from rclpy.lifecycle.managed_entity import ManagedEntity
 from rclpy.logging import set_logger_level
 
 from . import logger
@@ -137,12 +136,6 @@ class ComponentLaunchAction(NodeLaunchAction):
                     self._on_internal_event, "exit_all"
                 )
 
-            # Adds an emit event for components activation
-            self.__logger.debug("Registering Conditional Activation Handle")
-            self.__ros_node.add_components_activation_event(
-                partial(self._on_internal_event, "activate_all")
-            )
-
         # Get rclpy context and init the monitor
         self.__ros_context = Context()
         rclpy.init(context=self.__ros_context)
@@ -180,7 +173,7 @@ class ComponentLaunchAction(NodeLaunchAction):
 
     def _run(self):
         """
-        Overrides _run method of launch_ros.actions.Node to spin using the monitor loop_rate
+        Overrides _run method of launch_ros.actions.Node to spin using the executor spin timeout
         """
         if not self.__ros_executor:
             raise Exception("Node executor is unknown")
@@ -190,7 +183,7 @@ class ComponentLaunchAction(NodeLaunchAction):
                 # TODO: switch this to `spin()` when it considers
                 #   asynchronously added subscriptions.
                 self.__ros_executor.spin_once(
-                    timeout_sec=1 / self.__ros_node.config.loop_rate
+                    timeout_sec=self.__ros_node.config.executor_spin_timeout
                 )
         except KeyboardInterrupt:
             pass

@@ -9,7 +9,6 @@ from typing import (
     List,
     get_origin,
     Literal,
-    _GenericAlias,
 )
 import functools
 from copy import deepcopy
@@ -149,19 +148,9 @@ class BaseAttrs:
         elif isinstance(value, List) and attribute_type is np.ndarray:
             # Turn list into numpy array
             value = np.array(value)
-
-        # else:
-        #     # If not a Union type -> check using isinstance
-        #     # Handles only the origin of GenericAlias (dict, list)
-        #     _attribute_type = (
-        #         get_origin(attribute_type)
-        #         if isinstance(attribute_type, _GenericAlias)
-        #         else attribute_type
-        #     )
-        #     if not isinstance(value, _attribute_type):
-        #         raise TypeError(
-        #             f"Trying to set with incompatible type. Attribute {key} expecting '{type(attribute_to_set)}' got '{type(value)}'"
-        #         )
+            # NOTE: Silent failures can happen if someone passes wrong
+            # datatypes in YAML/TOML/JSON config files for non-generic /
+            # non-Union / non-Literal types
         return value
 
     def __parse_from_serialized_list(self, list_attr: List, value: List) -> List:
@@ -216,9 +205,13 @@ class BaseAttrs:
                     self.__parse_from_serialized_list(attribute_to_set, value),
                 )
             else:
-                # Handle Any typing as it cannot be checked with isinstance
+                # Any-typed fields are not allowed in base attrs derived classes
                 if attribute_type is Any:
-                    continue
+                    raise TypeError(
+                        f"Attribute '{key}' is typed as Any, which cannot be "
+                        f"validated. Declare a concrete type on the attrs "
+                        f"field to allow loading it from a config."
+                    )
                 elif attribute_type:
                     value = self.__check_value_against_attr_type(
                         key, value, attribute_to_set, attribute_type
