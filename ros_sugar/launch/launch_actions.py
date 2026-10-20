@@ -4,6 +4,7 @@ from typing import List, Optional, Union
 
 import launch
 import rclpy
+from rclpy.signals import SignalHandlerOptions
 from launch import event_handlers
 from launch.action import Action as ROSAction
 from launch_ros.actions import Node as NodeLaunchAction
@@ -15,6 +16,7 @@ from rclpy.logging import set_logger_level
 from . import logger
 from ..core.event import InternalEvent
 from ..core.monitor import Monitor
+from ..utils import InvalidHandle
 from ..core.component import BaseComponent
 
 
@@ -74,6 +76,9 @@ class ComponentLaunchAction(NodeLaunchAction):
         :param event_name: Event key name to identify which events got triggered
         :type event_name: str
         """
+        # On shutdown, dont care about events queued here
+        if self.__context.is_shutdown:
+            return
         try:
             # Create a launch event of type InternalEvent with the event name
             event = InternalEvent(
@@ -138,7 +143,8 @@ class ComponentLaunchAction(NodeLaunchAction):
 
         # Get rclpy context and init the monitor
         self.__ros_context = Context()
-        rclpy.init(context=self.__ros_context)
+        # launch owns the process's signals
+        rclpy.init(context=self.__ros_context, signal_handler_options=SignalHandlerOptions.NO)
         set_logger_level(self.__node_name, self.__log_level)
 
         self.__ros_node.rclpy_init_node(context=self.__ros_context)
@@ -179,12 +185,22 @@ class ComponentLaunchAction(NodeLaunchAction):
             raise Exception("Node executor is unknown")
         try:
             self.__ros_executor.add_node(self.__ros_node)
-            while self.__is_running:
+            while self.__is_running and not self.__context.is_shutdown:
                 # TODO: switch this to `spin()` when it considers
                 #   asynchronously added subscriptions.
-                self.__ros_executor.spin_once(
-                    timeout_sec=self.__ros_node.config.executor_spin_timeout
-                )
+                try:
+                    self.__ros_executor.spin_once(
+                        timeout_sec=self.__ros_node.config.executor_spin_timeout
+                    )
+                except InvalidHandle:
+                    # NOTE: A component that deactivates, restarts or reconfigures
+                    # destroys the timers and subscriptions its executor is
+                    # waiting on. Some rclpy versions raise from the wait set
+                    # instead of dropping the entity, and letting that out of
+                    # this loop ends the thread: the node stays up with
+                    # nothing spinning it, so nothing it creates later runs.
+                    # The next spin builds the wait set without what is gone
+                    continue
         except KeyboardInterrupt:
             pass
         finally:

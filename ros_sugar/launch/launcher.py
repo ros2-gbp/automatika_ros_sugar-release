@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import inspect
 import sys
-import socket
 import json
 from typing import (
     Awaitable,
@@ -15,22 +14,24 @@ from typing import (
     Optional,
     Union,
     Any,
+    Set,
     Tuple,
     Mapping,
     cast,
 )
-from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from shutil import which
 
-import msgpack
-import msgpack_numpy as m_pack
 import launch
 import rclpy
+from rclpy.signals import SignalHandlerOptions
+from rclpy.validate_topic_name import validate_topic_name
 from launch import LaunchDescription, LaunchIntrospector, LaunchService
 from launch.action import Action as ROSLaunchAction
 from launch.actions import (
     ExecuteProcess,
     GroupAction,
+    IncludeLaunchDescription,
     OpaqueCoroutine,
     OpaqueFunction,
     RegisterEventHandler,
@@ -38,6 +39,7 @@ from launch.actions import (
     SetEnvironmentVariable,
 )
 from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch_ros.actions import LifecycleNode as LifecycleNodeLaunchAction
 from launch_ros.actions import Node as NodeLaunchAction
 from launch_ros.actions import PushRosNamespace
@@ -46,26 +48,38 @@ from rclpy import logging
 from rclpy.lifecycle.managed_entity import ManagedEntity
 
 from . import logger
+from .signals import sigterm_shuts_down
 from .system_info import (
     serialize_component,
     serialize_event,
     serialize_fallbacks,
 )
 from ..io import Topic
+from ..io.ipc import ExternalProcessorServer, processor_id
 from ..io.supported_types import _additional_types
 from ..core.action import LogInfo
 from ..actions import publish_message
 from ..config.base_config import ComponentRunType
 from ..core.action import Action
+from ..core.routine import Routine
 from ..core.component import BaseComponent
-from ..core.monitor import Monitor
+from ..core.monitor import Monitor, unroutable_arguments
 from ..core.event import OnInternalEvent, Event
+from ..core._action_registry import SystemActionRegistry
 from .launch_actions import ComponentLaunchAction
 from ..base_clients import ServiceClientConfig, ActionClientConfig
 from ..utils import InvalidAction, action_handler, has_decorator, SomeEntitiesType
 from ..ui_node import UINode, UINodeConfig
 from ..robot import (
+    AmbiguousPluginEntryError,
+    Feedback,
+    FeedbackBus,
+    Mount,
     InProcessFeedbackBus,
+    Plugin,
+    PluginRole,
+    PluginShmManager,
+    ProcessSpec,
     RobotPlugin,
     RobotPluginHost,
     SocketFeedbackBus,
@@ -80,14 +94,31 @@ if __installed_distro in ["humble", "galactic", "foxy"]:
 else:
     from launch_ros.actions import LifecycleTransition
 
-# patch msgpack for numpy arrays
-m_pack.patch()
-
 
 # Return codes that indicate the process was terminated by a signal rather
 # than a genuine crash. Launch/subprocess reports signal terminations as
 # negative values (-signum); shells that propagate them use 128+signum.
 _SIGNAL_EXIT_CODES = frozenset({-2, -9, -15, 130, 137, 143})
+
+
+def _check_ros_executable(package: str, executable: str) -> None:
+    """Fail now if launch_ros would not find ``executable`` in ``package``.
+
+    :raises PackageNotFoundError: If the package is not installed
+    :raises FileNotFoundError: If the package has no such executable
+    """
+    from ament_index_python.packages import PackageNotFoundError, get_package_prefix
+
+    try:
+        prefix = get_package_prefix(package)
+    except PackageNotFoundError:
+        raise PackageNotFoundError(
+            f"package '{package}' is not installed, or its workspace is not sourced"
+        ) from None
+    if which(executable, path=os.path.join(prefix, "lib", package)) is None:
+        raise FileNotFoundError(
+            f"package '{package}' is installed but has no executable '{executable}'"
+        )
 
 
 UI_EXTENSIONS = {}
@@ -158,9 +189,9 @@ class Launcher:
             serializable spec. Defaults to None.
         :type robot_plugin: Optional[RobotPlugin], optional
         """
-        # Make sure RCLPY in initialized
+        # Make sure RCLPY is initialized. launch owns the process's signals
         if not rclpy.ok():
-            rclpy.init()
+            rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
 
         # Setup launch description
         self._description = LaunchDescription()
@@ -171,11 +202,31 @@ class Launcher:
         self._config_file: Optional[str] = config_file
         self._launch_group = []
         self._enable_ui = False
-        self._robot_plugin = robot_plugin
-        self._robot_plugin_host: Optional[RobotPluginHost] = None
+        # The UI node, created at setup when the UI is enabled
+        self._ui_node: Optional[UINode] = None
+        # Routines shown in the UI, to host on the Monitor whether or not an
+        # event triggers them
+        self._ui_routines: List[Routine] = []
+        self._plugins: Dict[str, Plugin] = {}
+        self._plugin_hosts: List[RobotPluginHost] = []
+        # Plugin feedback the recipe asked to have on ROS, as (feedback, topic)
+        self._feedbacks_on_ros: List[Tuple[Feedback, Optional[str]]] = []
+        self._mounts: List[Mount] = []
+        if robot_plugin is not None:
+            self.add_plugin(robot_plugin)
+        # Shared by every attached plugin host, so the launcher owns it
+        self._plugin_bus: Optional[FeedbackBus] = None
+        # Shared-memory writer pool for large feedbacks on the socket bus
+        self._plugin_shm: Optional[PluginShmManager] = None
         # Tracks whether the recipe explicitly set robot config. If not config
         # is pulled from a plugin. In case both present, recipe wins.
         self._robot_explicitly_set: bool = False
+        # The config the recipe set, applied again at bringup so components
+        # added after it was set get it too
+        self._explicit_robot_config: Any = None
+        self._frames_explicitly_set: bool = False
+        # Frame settings from the recipe
+        self._frame_settings: List[Tuple[str, Any]] = []
 
         # Components list and package/executable
         self._components: List[BaseComponent] = []
@@ -203,6 +254,8 @@ class Launcher:
 
         # Events/Actions dictionaries
         self._internal_events: Optional[List[Event]] = None
+        # Built in _setup_monitor_node, read by _init_monitor_node
+        self._action_registry: Optional[SystemActionRegistry] = None
         self._internal_event_names: Optional[List[str]] = None
         self._ros_events_actions: Dict[str, List[ROSLaunchAction]] = {}
         # Dictionaries {serialized_event: actions}
@@ -210,8 +263,8 @@ class Launcher:
         self._components_events_actions: Dict[str, List[Action]] = {}
         self.__events_names: List[str] = []
 
-        # Thread pool for external processors
-        self._thread_pool: Union[ThreadPoolExecutor, None] = None
+        # Server of the external processors of components in their own process
+        self._processor_server: Optional[ExternalProcessorServer] = None
 
         # Process-level crash recovery state
         self._process_fail_max_retries: Optional[int] = None
@@ -226,7 +279,12 @@ class Launcher:
         events_actions: Optional[
             Mapping[
                 Event,
-                Union[Action, ROSLaunchAction, List[Union[Action, ROSLaunchAction]]],
+                Union[
+                    Action,
+                    ROSLaunchAction,
+                    Routine,
+                    List[Union[Action, ROSLaunchAction, Routine]],
+                ],
             ]
         ] = None,
         multiprocessing: bool = False,
@@ -305,11 +363,9 @@ class Launcher:
 
         # Configure components from config_file
         for component in components:
-            # Hand each component the robot plugin instance.
-            # NOTE: In multithreaded launch the component thread uses this HOST
-            # instance directly; in multiprocess launch it is only used to
-            # serialize the plugin spec into the component's launch args
-            component._robot_plugin = self._robot_plugin
+            # NOTE: plugins are handed out at bringup by `_distribute_plugins`,
+            # not here, so that a recipe may call add_pkg and add_plugin in
+            # either order and still have every component receive every plugin
             if rclpy_log_level:
                 self._rclpy_log_level[component.node_name] = rclpy_log_level
             if ros_log_level:
@@ -321,7 +377,12 @@ class Launcher:
     def on(
         self,
         event: Event,
-        action: Union[Action, ROSLaunchAction, List[Union[Action, ROSLaunchAction]]],
+        action: Union[
+            Action,
+            ROSLaunchAction,
+            Routine,
+            List[Union[Action, ROSLaunchAction, Routine]],
+        ],
     ) -> None:
         """Register an event/action mapping on the launcher.
 
@@ -350,9 +411,12 @@ class Launcher:
         ] = None,
         outputs: Optional[List[Topic]] = None,
         port: int = 5001,
-        ssl_keyfile_path: str = "key.pem",
-        ssl_certificate_path: str = "cert.pem",
         hide_settings_panel: bool = False,
+        serve_browser: bool = True,
+        api_stream_default_rate: float = 10.0,
+        api_max_stream_rate: float = 30.0,
+        secure: bool = True,
+        routines: Optional[List[Union[Routine, str]]] = None,
     ):
         """
         Enables the user interface (UI) subsystem for recipes, initializing all UI extensions
@@ -378,25 +442,92 @@ class Launcher:
             Defaults to ``5001``.
         :type port: int
 
-        :param ssl_keyfile_path:
-            Path to the private key file used for SSL/TLS encryption. Defaults to ``"key.pem"``.
-        :type ssl_keyfile_path: str
-
-        :param ssl_certificate_path:
-            Path to the SSL/TLS certificate file used to authenticate the UI server.
-            Defaults to ``"cert.pem"``.
-        :type ssl_certificate_path: str
-
         :param hide_settings_panel:
             Disable the components settings panel in the UI.
         :type hide_settings_panel: bool, default False
+
+        :param serve_browser:
+            Serve the browser front-end alongside the JSON/WebSocket API.
+            Set to ``False`` to serve the API only, which requires just
+            ``starlette`` and ``uvicorn`` instead of the browser dependencies
+            (FastHTML/MonsterUI).
+        :type serve_browser: bool, default True
+
+        :param api_stream_default_rate:
+            Rate (Hz) at which the JSON API streams rate-sampled output topics
+            to a connected client that does not request a rate explicitly.
+        :type api_stream_default_rate: float, default 10.0
+
+        :param api_max_stream_rate:
+            Hard upper bound (Hz) for a client-requested API stream rate.
+        :type api_max_stream_rate: float, default 30.0
+
+        :param secure:
+            Serve over HTTPS. The certificate is the one named by the
+            ``SUGARCOAT_UI_TLS_CERT`` and ``SUGARCOAT_UI_TLS_KEY`` environment
+            variables, else one minted and renewed by Sugarcoat. Set ``False``
+            only for development: the UI is then served over plain HTTP.
+        :type secure: bool, default True
+        :param routines:
+            Routines shown in the UI's Tasks, each with its steps and progress
+            and controls to start, pause, resume and abort it. A ``Routine`` is
+            hosted on the Monitor even when no event triggers it, so a routine
+            meant to be started from the UI alone needs nothing else. A name
+            refers to a routine registered some other way, such as by an event
+            or through the runtime API.
+        :type routines: Optional[List[Union[Routine, str]]]
         """
+
+        # A type without a callback in a derived package cannot be a UI output
+        for topic in outputs or []:
+            if topic.msg_type.callback is None:
+                raise TypeError(
+                    f"UI output '{topic.name}' has type "
+                    f"'{topic.msg_type.__name__}', which has no callback, so it "
+                    "cannot be shown in the UI"
+                )
+
+        # Fail fast if dependencies of the requested UI mode are missing
+        from importlib.util import find_spec
+
+        # import name -> pip name
+        required = {"starlette": "starlette", "uvicorn": "uvicorn"}
+        if serve_browser:
+            required["fasthtml"] = "python-fasthtml"
+            required["monsterui"] = "monsterui"
+        missing = [pip for mod, pip in required.items() if find_spec(mod) is None]
+        if missing:
+            message = (
+                "enable_ui requires packages that are not installed: "
+                f"{', '.join(missing)}.\n"
+            )
+            if serve_browser:
+                message += (
+                    "Install the browser UI stack (includes starlette and "
+                    "uvicorn) with:\n"
+                    "    pip install python-fasthtml monsterui\n"
+                    "Or serve only the JSON/WebSocket API (no browser) with "
+                    "enable_ui(serve_browser=False), which requires just:\n"
+                    "    pip install starlette uvicorn"
+                )
+            else:
+                message += "Install with: pip install starlette uvicorn"
+            raise ModuleNotFoundError(message)
 
         self._ui_input_elements = []
         self._ui_output_elements = []
-        for ext in UI_EXTENSIONS:
-            input_elements_dict, output_elements_dict = UI_EXTENSIONS[ext]()
-            # Additional input/output elements are used for UI elements coming from derived packages
+        self._ui_task_elements = []
+
+        # NOTE: UI extensions provide browser widgets. They are skipped
+        # entirely in API-only mode
+        extensions = UI_EXTENSIONS if serve_browser else {}
+        for ext in extensions:
+            # A package that owns no task card returns only the topic elements
+            input_elements_dict, output_elements_dict, *task_elements = UI_EXTENSIONS[
+                ext
+            ]()
+            # Additional input/output elements are used for UI elements coming
+            # from derived packages
             for key, element in input_elements_dict.items():
                 self._ui_input_elements.append((
                     f"{key.__module__}.{key.__qualname__}",
@@ -408,6 +539,15 @@ class Launcher:
                     f"{key.__module__}.{key.__qualname__}",
                     f"{element.__module__}.{element.__qualname__}",
                 ))
+            # serialize the task cards, keyed by the action type they are for
+            for key, element in (task_elements[0] if task_elements else {}).items():
+                self._ui_task_elements.append((
+                    f"{key.__module__}.{key.__qualname__}",
+                    f"{element.__module__}.{element.__qualname__}",
+                ))
+
+        routine_names = self._ui_routine_names(routines or [])
+        self._ui_routines = [r for r in routines or [] if isinstance(r, Routine)]
 
         self._enable_ui = True
         self._ui_input_topics = inputs
@@ -415,10 +555,35 @@ class Launcher:
 
         self._ui_node_config: UINodeConfig = UINodeConfig(
             port=port,
-            ssl_keyfile=ssl_keyfile_path,
-            ssl_certificate=ssl_certificate_path,
             hide_settings=hide_settings_panel,
+            serve_browser=serve_browser,
+            api_stream_default_rate=api_stream_default_rate,
+            api_max_stream_rate=api_max_stream_rate,
+            secure=secure,
+            routines=routine_names,
         )
+
+    @staticmethod
+    def _ui_routine_names(routines: List[Union[Routine, str]]) -> List[str]:
+        """The names of the routines given to the UI, each given once
+
+        :param routines: Routines, or names of routines
+        :raises TypeError: If an entry is neither
+        :raises ValueError: If a routine is given twice
+        :rtype: List[str]
+        """
+        names: List[str] = []
+        for routine in routines:
+            if not isinstance(routine, (Routine, str)):
+                raise TypeError(
+                    "A UI routine is a Routine or the name of one, got "
+                    f"{type(routine).__name__}"
+                )
+            name = routine.name if isinstance(routine, Routine) else routine
+            if name in names:
+                raise ValueError(f"Routine '{name}' is given to the UI twice")
+            names.append(name)
+        return names
 
     @property
     def robot(self) -> Dict[str, Any]:
@@ -443,6 +608,7 @@ class Launcher:
         :type config: RobotConfig
         """
         self._robot_explicitly_set = True
+        self._explicit_robot_config = robot_config
         self._broadcast_robot_config(robot_config)
 
     def _broadcast_robot_config(self, robot_config) -> None:
@@ -459,21 +625,518 @@ class Launcher:
                         f"Cannot set component {component.node_name} 'robot' configuration parameter of type '{type(component.config.robot)}' to provided value of type '{type(robot_config)}'. Skipping setting robot configuration for '{component.node_name}'"
                     )
 
+    @property
+    def _robot_plugin(self) -> Optional[RobotPlugin]:
+        """The attached plugin describing the robot, if any."""
+        for plugin in self._plugins.values():
+            if plugin.role is PluginRole.ROBOT:
+                return plugin
+        return None
+
+    @_robot_plugin.setter
+    def _robot_plugin(self, plugin: Optional[RobotPlugin]) -> None:
+        """Attach (or clear) the robot plugin, leaving other plugins alone."""
+        for key, attached in list(self._plugins.items()):
+            if attached.role is PluginRole.ROBOT:
+                del self._plugins[key]
+        if plugin is not None:
+            self.add_plugin(plugin)
+
+    def add_plugin(self, plugin: Plugin, mount: Optional[Mount] = None) -> None:
+        """Attach a plugin to the recipe.
+
+        Every component in the recipe is given every attached plugin.
+
+        :param plugin: The plugin to attach. Its ``id`` -- set with ``id=`` at
+            construction, or derived from its name -- is how a topic addresses
+            it and how its channels are namespaced.
+        :type plugin: Plugin
+
+        :param mount: Where this sensor sits, when nothing else publishes its
+            frame into TF. Omit it if a URDF, a ``robot_state_publisher`` or
+            the sensor's own driver already does. A robot plugin's own
+            sensor placements come from its ``mounts`` list instead.
+        :type mount: Optional[Mount]
+
+        :raises ValueError: If a second robot plugin is attached, or if the id
+            is already taken by another plugin.
+        """
+        plugin_id = plugin.id
+
+        if plugin.role is PluginRole.ROBOT and (existing := self._robot_plugin):
+            raise ValueError(
+                f"Cannot attach robot plugin '{plugin.metadata.name}': a recipe "
+                f"describes one robot and '{existing.metadata.name}' is already "
+                "attached."
+            )
+        if plugin_id in self._plugins:
+            raise ValueError(
+                f"Cannot attach plugin as '{plugin_id}': that id is already taken "
+                f"by '{self._plugins[plugin_id].metadata.name}'. Give one of them "
+                "a distinct id at construction, e.g. "
+                f"{type(plugin).__name__}(id='front_cam')."
+            )
+        # NOTE: Identity has to be final now, not at bringup. Events are built from
+        # plugins in the recipe, and their topic names are frozen before plugin
+        # setup runs
+        plugin._bind_identity()
+        self._plugins[plugin_id] = plugin
+        if mount is not None:
+            mount.child = plugin
+            self._mounts.append(mount)
+        # A robot plugin may place its own built-in sensors (child = the frame
+        # those sensors' messages name); publish them like any other mount
+        for sensor_mount in getattr(plugin, "mounts", None) or []:
+            if sensor_mount.child is None:
+                raise ValueError(
+                    f"A mount declared by plugin '{plugin.metadata.name}' names no "
+                    "child frame: set 'child' to the frame the sensor publishes in."
+                )
+            self._mounts.append(sensor_mount)
+
+    def publish_plugin_feedback(
+        self, feedback: Feedback, topic_name: Optional[str] = None
+    ) -> None:
+        """Publish a plugin feedback on the ROS network, for ROS nodes outside
+        the recipe (e.g. one added with `add_ros_node`) to subscribe to.
+
+        The plugin host publishes it from the launcher process with the
+        feedback's own message type, so a subscriber cannot end up on a topic of
+        a different type. A feedback already carried on a ROS topic is on ROS
+        already: it is not published again, and a warning names its topic.
+
+        The feedback counts as used by the recipe, so a plugin that only
+        provides what is asked for (see `Plugin.requested_feedbacks`) provides
+        it. A feedback declaring ``publish_tf`` also has its transform
+        broadcast once it is published.
+
+        Can be called before or after the plugin is attached::
+
+            launcher.add_plugin(robot)
+            launcher.publish_plugin_feedback(robot.feedbacks["Odometry"], "/odom")
+
+        :param feedback: The feedback, taken from ``plugin.feedbacks`` of a
+            plugin attached to this recipe.
+        :type feedback: Feedback
+        :param topic_name: ROS topic to publish it on. Relative names are resolved
+            in the Launcher namespace. Defaults to ``<plugin id>/<feedback key>``.
+        :type topic_name: Optional[str]
+        :raises TypeError: If ``feedback`` is not a `Feedback`
+        :raises InvalidTopicNameException: If ``topic_name`` is not a valid ROS topic name
+        """
+        if not isinstance(feedback, Feedback):
+            raise TypeError(
+                "publish_plugin_feedback expects a plugin Feedback, taken from "
+                f"'plugin.feedbacks', got {type(feedback).__name__}"
+            )
+        if topic_name is not None:
+            validate_topic_name(topic_name)
+        self._feedbacks_on_ros.append((feedback, topic_name))
+
+    def _plugin_owning(self, feedback: Feedback) -> Optional[Plugin]:
+        """The attached plugin ``feedback`` belongs to, or ``None``."""
+        plugin = self._plugins.get(feedback.owner_id)
+        if plugin is None or plugin.feedbacks.get(feedback.key) is not feedback:
+            return None
+        return plugin
+
+    def _resolve_feedbacks_on_ros(self) -> Dict[str, List[Tuple[str, str]]]:
+        """Resolve `publish_plugin_feedback` requests against the attached plugins.
+
+        :raises ValueError: If a feedback belongs to no attached plugin
+        :return: ``(feedback_key, topic)`` pairs each plugin host must publish
+            on ROS, by plugin id
+        """
+        host_publishes: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        for feedback, topic in self._feedbacks_on_ros:
+            plugin = self._plugin_owning(feedback)
+            if plugin is None:
+                raise ValueError(
+                    f"Cannot publish feedback '{feedback.key}' on ROS: it does "
+                    "not belong to a plugin attached to this recipe. Pass a "
+                    "feedback from 'plugin.feedbacks' of an attached plugin. "
+                    f"Attached plugins: {', '.join(self._plugins) or 'none'}."
+                )
+            if feedback.is_ros_topic:
+                ros_topic = feedback.transport.topic_name
+                logger.warning(
+                    f"Feedback '{feedback.key}' of plugin '{plugin.id}' is already "
+                    f"published on ROS topic '{ros_topic}'; not publishing it again"
+                    + (f" on '{topic}'." if topic and topic != ros_topic else ".")
+                )
+                continue
+            topic = topic or f"{plugin.id}/{feedback.key}"
+            validate_topic_name(topic)
+            host_publishes[plugin.id].append((feedback.key, topic))
+        return host_publishes
+
+    def _check_feedback_topic_clashes(
+        self, host_publishes: Dict[str, List[Tuple[str, str]]]
+    ) -> None:
+        """Refuse two streams on one ROS topic, which subscribers would receive
+        interleaved, or mistyped.
+
+        :raises ValueError: If two different feedbacks, or a feedback and a
+            component output, would be published on the same topic
+        """
+        # Compared fully resolved: a relative name lands in the Launcher namespace
+        def resolved(topic: str) -> str:
+            if topic.startswith("/"):
+                return topic
+            return "/" + "/".join(filter(None, (self._namespace.strip("/"), topic)))
+
+        owners: Dict[str, Tuple[str, str]] = {}
+        for plugin_id, pairs in host_publishes.items():
+            for key, topic in pairs:
+                owner = owners.setdefault(resolved(topic), (plugin_id, key))
+                if owner != (plugin_id, key):
+                    raise ValueError(
+                        f"Feedback '{key}' of plugin '{plugin_id}' and feedback "
+                        f"'{owner[1]}' of plugin '{owner[0]}' are both to be "
+                        f"published on ROS topic '{topic}'. Give each its own topic."
+                    )
+        for component in self._components:
+            for out_topic in getattr(component, "out_topics", None) or []:
+                name = resolved(out_topic.name)
+                if out_topic.use_plugin or name not in owners:
+                    continue
+                plugin_id, key = owners[name]
+                raise ValueError(
+                    f"Feedback '{key}' of plugin '{plugin_id}' is to be published "
+                    f"on ROS topic '{name}', which component "
+                    f"'{component.node_name}' already publishes on. Give the "
+                    "feedback its own topic."
+                )
+
+    def _publish_mounts(self) -> None:
+        """Hand every declared mount to the Monitor as a static transform to be
+        published to /tf_static."""
+        mounts = list(self._mounts)
+        robot = self._robot_plugin
+        if robot is not None and robot.base_frame and robot.base_height is not None:
+            mounts.append(
+                Mount(
+                    parent=robot.footprint_frame,
+                    child=robot.base_frame,
+                    xyz=(0.0, 0.0, robot.base_height),
+                )
+            )
+        if not mounts:
+            return
+        from geometry_msgs.msg import TransformStamped
+
+        from ..robot.mount import quaternion_from_euler
+
+        transforms = []
+        for mount in mounts:
+            transform = TransformStamped()
+            transform.header.frame_id = mount.parent_frame
+            transform.child_frame_id = mount.child_frame
+            (
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z,
+            ) = (float(v) for v in mount.xyz)
+            (
+                transform.transform.rotation.x,
+                transform.transform.rotation.y,
+                transform.transform.rotation.z,
+                transform.transform.rotation.w,
+            ) = quaternion_from_euler(*(float(v) for v in mount.rpy))
+            transforms.append(transform)
+            logger.info(
+                f"Mounting '{transform.child_frame_id}' on "
+                f"'{transform.header.frame_id}'"
+            )
+
+        self.monitor_node.set_static_transforms(transforms)
+
+    def _validate_plugin_references(self) -> None:
+        """Check every topic's ``use_plugin`` against the attached plugins.
+
+        A topic naming a plugin that is not attached would otherwise fall back
+        to an ordinary ROS topic that nothing publishes. Catch it here, where both
+        the components and the plugins are known, and say what is available.
+
+        :raises ValueError: If a topic names a plugin that is not attached, or
+            asks for the robot plugin when none is.
+        """
+        owned_topics = [
+            # A component declares outputs only if it has any
+            (
+                f"Component '{component.node_name}' topic",
+                list(getattr(component, "in_topics", None) or [])
+                + list(getattr(component, "out_topics", None) or []),
+            )
+            for component in self._components
+        ] + [
+            (f"Event '{event.id}' topic", event.get_involved_topics())
+            for event in self._events_actions
+        ]
+        for owner, topics in owned_topics:
+            for topic in topics:
+                if not topic.use_plugin:
+                    continue
+                if topic.use_plugin is True:
+                    if self._robot_plugin is None:
+                        raise ValueError(
+                            f"{owner} '{topic.name}' asks for the robot plugin "
+                            "(use_plugin=True) but no robot plugin is attached "
+                            "to this recipe."
+                        )
+                    continue
+                if topic.use_plugin not in self._plugins:
+                    raise ValueError(
+                        f"{owner} '{topic.name}' is bound to plugin "
+                        f"'{topic.use_plugin}', which is not attached to this "
+                        "recipe. Attached plugins: "
+                        f"{', '.join(self._plugins) or 'none'}."
+                    )
+
+    def _plugin_for_topic(self, topic) -> Optional[Plugin]:
+        """Resolve which attached plugin serves a topic, or ``None``.
+
+        ``use_plugin=True`` means the robot plugin; a string names a plugin by
+        its id. Mirrors the component-side resolution of the same name, minus
+        the logging — `_validate_plugin_references` has already rejected the
+        cases worth complaining about by the time this runs.
+        """
+        if not topic.use_plugin:
+            return None
+        if topic.use_plugin is True:
+            return self._robot_plugin
+        return self._plugins.get(topic.use_plugin)
+
+    def _feedback_keys_on_ros(self) -> Dict[str, Set[str]]:
+        """Keys of the feedback `publish_plugin_feedback` asked for, by plugin id."""
+        keys: Dict[str, Set[str]] = {pid: set() for pid in self._plugins}
+        for feedback, _ in self._feedbacks_on_ros:
+            if plugin := self._plugin_owning(feedback):
+                keys[plugin.id].add(feedback.key)
+        return keys
+
+    def _resolve_plugin_demand(self) -> None:
+        """Tell each plugin which of its entries the recipe actually uses. Knowing what was asked for lets a plugin provide exactly that; see `Plugin.required_processes`.
+
+        Runs before the plugin hosts open, so `Plugin.on_attached` and
+        `required_processes` both see a populated set.
+        """
+        if not self._plugins:
+            return
+        # Feedback the recipe publishes on ROS is used too, by whatever reads it
+        feedbacks = self._feedback_keys_on_ros()
+        commands: Dict[str, Set[str]] = {pid: set() for pid in self._plugins}
+
+        for component in self._components:
+            for topics, resolver, target in (
+                (getattr(component, "in_topics", None), "resolve_feedback", feedbacks),
+                (getattr(component, "out_topics", None), "resolve_command", commands),
+            ):
+                for topic in topics or []:
+                    plugin = self._plugin_for_topic(topic)
+                    if plugin is None:
+                        continue
+                    try:
+                        entry = getattr(plugin, resolver)(
+                            topic.name, topic.msg_type.__name__
+                        )
+                    except (TypeError, AmbiguousPluginEntryError):
+                        # A mis-wired topic. The component logs it and falls
+                        # back to an ordinary ROS topic
+                        continue
+                    if entry is not None:
+                        target[plugin.id].add(entry.key)
+
+        # Events on a topic a plugin serves read its feedback too
+        for event in self._events_actions:
+            for topic in event.get_involved_topics():
+                plugin = self._plugin_for_topic(topic)
+                if plugin is None:
+                    continue
+                try:
+                    feedback = plugin.resolve_feedback(topic.name, topic.msg_type.__name__)
+                except (TypeError, AmbiguousPluginEntryError):
+                    # Whoever evaluates the event logs it
+                    continue
+                if feedback is not None:
+                    feedbacks[plugin.id].add(feedback.key)
+
+        for plugin_id, plugin in self._plugins.items():
+            plugin._set_requested(
+                frozenset(feedbacks[plugin_id]), frozenset(commands[plugin_id])
+            )
+            if requested := sorted(feedbacks[plugin_id] | commands[plugin_id]):
+                logger.debug(f"Plugin '{plugin_id}' serves: {', '.join(requested)}")
+
+    def _launch_plugin_processes(self, plugin: Plugin) -> List[Tuple[str, str]]:
+        """Add launch actions for the external drivers a plugin declares.
+
+        A driver that is not installed fails bringup. The recipe asked for the
+        data it serves, so running without it would lead to unhealthy behavior.
+
+        A driver's ``inputs`` are delivered on the topics it reads: a feedback
+        already on a ROS topic by remapping the driver onto it, and any other
+        by the plugin host publishing it there, which the caller arranges from
+        the returned pairs.
+
+        :raises PackageNotFoundError: If a driver's package is not installed
+        :raises FileNotFoundError: If a driver's package has no such executable
+        :raises ValueError: If a driver's inputs name a feedback the plugin
+            does not have
+        :return: ``(feedback_key, topic)`` pairs the plugin host must publish
+            on ROS, for the drivers that were started
+        :rtype: List[Tuple[str, str]]
+        """
+        from ament_index_python.packages import PackageNotFoundError
+
+        try:
+            # Materialized here, so a plugin returning something that is not a
+            # list is reported like any other declaration fault
+            specs = list(plugin.required_processes() or [])
+        except Exception as e:
+            logger.error(
+                f"Plugin '{plugin.id}' failed to declare its required "
+                f"processes: {e}. No driver will be started for it."
+            )
+            return []
+
+        host_publishes: List[Tuple[str, str]] = []
+        for spec in specs:
+            try:
+                if spec.precondition is not None and not spec.precondition():
+                    logger.info(
+                        f"Plugin '{plugin.id}': not starting '{spec.label}' "
+                        "(precondition not met -- typically the driver is "
+                        "already running)"
+                    )
+                    continue
+            except Exception as e:
+                logger.error(
+                    f"Plugin '{plugin.id}': precondition for driver "
+                    f"'{spec.label}' failed: {e}. Not starting it."
+                )
+                continue
+            launch_kwargs = spec.launch_kwargs()
+            remappings, published = self._plugin_process_inputs(plugin, spec)
+            if remappings:
+                launch_kwargs["remappings"] = list(spec.remappings or []) + remappings
+            try:
+                self.add_ros_node(**launch_kwargs)
+            except (PackageNotFoundError, FileNotFoundError) as e:
+                used = ", ".join(sorted(plugin.requested_feedbacks)) or "none"
+                raise type(e)(
+                    f"Plugin '{plugin.id}' needs the driver '{spec.label}', but "
+                    f"{e.args[0]}. The recipe uses these feedbacks from the "
+                    f"plugin: {used}. Install the package and source its "
+                    "workspace, or stop using those topics in the recipe so the "
+                    "driver is not needed."
+                ) from None
+            logger.info(f"Plugin '{plugin.id}': starting driver '{spec.label}'")
+            host_publishes.extend(published)
+        return host_publishes
+
+    @staticmethod
+    def _plugin_process_inputs(
+        plugin: Plugin, spec: ProcessSpec
+    ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+        """How to deliver each of a driver's ``inputs`` on the topic it reads.
+
+        :raises ValueError: If an input names a feedback the plugin does not have
+        :return: Remappings to add to the driver, and ``(feedback_key, topic)``
+            pairs for the plugin host to publish
+        """
+        remappings: List[Tuple[str, str]] = []
+        published: List[Tuple[str, str]] = []
+        for key, topic in (spec.inputs or {}).items():
+            feedback = plugin.feedbacks.get(key)
+            if feedback is None:
+                raise ValueError(
+                    f"Plugin '{plugin.id}' declares that driver '{spec.label}' "
+                    f"reads its feedback '{key}', but the plugin has no such "
+                    f"feedback. Available: {sorted(plugin.feedbacks)}"
+                )
+            if feedback.is_ros_topic:
+                # Already on ROS: point the driver at the real topic
+                if feedback.transport.topic_name != topic:
+                    remappings.append((topic, feedback.transport.topic_name))
+            else:
+                published.append((key, topic))
+        return remappings, published
+
+    def _distribute_plugins(self) -> None:
+        """Hand every attached plugin to every component.
+
+        NOTE: In multithreaded launch the component thread uses these HOST
+        instances directly; in multiprocess launch they are only used to
+        serialize the plugin specs into each component's launch args.
+        """
+        for component in self._components:
+            for plugin in self._plugins.values():
+                component.add_plugin(plugin)
+
     def _apply_plugin_robot_config(self) -> None:
         """Pull ``robot_config`` from the attached plugin and broadcast it to
-        every component, unless the recipe already set one explicitly
+        every component, unless the recipe already set one explicitly. A config
+        the recipe set is broadcast again instead, to reach the components
+        added after it was set
         """
         if self._robot_explicitly_set:
+            self._broadcast_robot_config(self._explicit_robot_config)
             return
         if self._robot_plugin is None:
             return
-        robot_config = getattr(self._robot_plugin, "robot_config", None)
+        robot_config = self._robot_plugin.robot_config
         if robot_config is None:
             return
         logger.info(
             f"Applying robot config from plugin '{self._robot_plugin.metadata.name}'"
         )
         self._broadcast_robot_config(robot_config)
+
+    def _apply_plugin_base_frame(self) -> None:
+        """Apply the attached robot plugin's body frame to every component.
+
+        Only ``robot_base`` is taken from the robot plugin. It is the one frame
+        the robot itself defines.
+
+        NOTE: The plugin's frame wins over whatever the recipe holds. `RobotFrames`
+        carries a default body frame, so a recipe that only wanted to name the
+        world frame would otherwise silently discard the plugin's, leaving
+        anything mounted on the plugin parented to a frame no component looks
+        up. To publish under a different name, rename it on the plugin, which
+        keeps its telemetry and its mounts in agreement::
+
+            plugin.base_frame = "base_link"
+        """
+        if self._robot_plugin is None:
+            return
+        base_frame = self._robot_plugin.base_frame
+        if base_frame is None:
+            return
+        replaced = {
+            component.config.frames.robot_base
+            for component in self._components
+            if hasattr(component.config, "frames")
+            and component.config.frames.robot_base != base_frame
+        }
+        if not replaced:
+            return
+        plugin_name = self._robot_plugin.metadata.name
+        if self._frames_explicitly_set:
+            named = ", ".join(f"'{frame}'" for frame in sorted(replaced))
+            logger.warning(
+                f"The recipe set the robot body frame to {named}, but plugin "
+                f"'{plugin_name}' reports '{base_frame}'. Using the plugin's "
+                "frame name. To publish under a different name, set it on the "
+                "plugin itself before bringup."
+            )
+        else:
+            logger.info(
+                f"Applying robot base frame '{base_frame}' from plugin '{plugin_name}'"
+            )
+        for component in self._components:
+            if hasattr(component.config, "frames"):
+                component.config.frames.robot_base = base_frame
 
     @property
     def frames(self) -> Dict[str, Any]:
@@ -497,6 +1160,12 @@ class Launcher:
         :param frames_config: Robot frames configuration
         :type frames_config: RobotFrames
         """
+        self._frames_explicitly_set = True
+        self._frame_settings.append(("frames", frames_config))
+        self._broadcast_frames(frames_config)
+
+    def _broadcast_frames(self, frames_config) -> None:
+        """Assign a frames configuration to every component that has one"""
         for component in self._components:
             if hasattr(component.config, "frames"):
                 try:
@@ -505,6 +1174,84 @@ class Launcher:
                     logger.error(
                         f"Cannot set component {component.node_name} 'frames' configuration parameter of type '{type(component.config.frames)}' to provided value of type '{type(frames_config)}' Skipping setting frames configuration for '{component.node_name}'"
                     )
+
+    def _set_frame(self, attribute: str, frame: str) -> None:
+        """Set one frame on every component that has a frames configuration."""
+        if not isinstance(frame, str) or not frame:
+            raise ValueError(f"Frame name must be a non-empty string, got {frame!r}")
+        self._frame_settings.append((attribute, frame))
+        self._broadcast_frame(attribute, frame)
+
+    def _broadcast_frame(self, attribute: str, frame: str) -> None:
+        """Set one frame on every component that has a frames configuration"""
+        for component in self._components:
+            if hasattr(component.config, "frames"):
+                setattr(component.config.frames, attribute, frame)
+
+    def _apply_recipe_frames(self) -> None:
+        """Apply the recipe's frame settings again, in the order they were made,
+        to reach the components added after them"""
+        for attribute, value in self._frame_settings:
+            if attribute == "frames":
+                self._broadcast_frames(value)
+            else:
+                self._broadcast_frame(attribute, value)
+
+    @property
+    def robot_frame(self) -> Dict[str, str]:
+        """
+        Getter of the robot body frame of all components
+
+        :return: Robot body frame per component
+        :rtype: Dict[str, str]
+        """
+        return {
+            component.node_name: component.config.frames.robot_base
+            for component in self._components
+            if hasattr(component.config, "frames")
+        }
+
+    @robot_frame.setter
+    def robot_frame(self, frame: str) -> None:
+        """
+        Setter of the robot body frame for all components
+
+        Sets that one frame, so naming it does not disturb the world frame.
+        An attached robot plugin reports the frame its own telemetry is
+        stamped in and that takes precedence at bringup.
+
+        :param frame: Frame rigidly attached to the robot body
+        :type frame: str
+        """
+        self._frames_explicitly_set = True
+        self._set_frame("robot_base", frame)
+
+    @property
+    def world_frame(self) -> Dict[str, str]:
+        """
+        Getter of the world frame of all components
+
+        :return: World frame per component
+        :rtype: Dict[str, str]
+        """
+        return {
+            component.node_name: component.config.frames.world
+            for component in self._components
+            if hasattr(component.config, "frames")
+        }
+
+    @world_frame.setter
+    def world_frame(self, frame: str) -> None:
+        """
+        Setter of the world frame for all components
+
+        Sets that one frame, so naming it does not disturb the robot body
+        frame.
+
+        :param frame: Global reference frame the robot operates in
+        :type frame: str
+        """
+        self._set_frame("world", frame)
 
     def inputs(self, **kwargs):
         """
@@ -600,11 +1347,112 @@ class Launcher:
         :param action: Action
         :type action: Action
         """
+        if isinstance(action, Routine):
+            # A routine is driven by callbacks on the node that hosts it, and
+            # the launch system has no node to host it on
+            raise InvalidAction(
+                f"Routine '{action.name}' cannot be executed by the launch "
+                "system. Routines are hosted by the Monitor, so a routine cannot be "
+                "attached to a lifecycle transition or any other launch entity."
+            )
+        if isinstance(action, Action) and action.is_monitored:
+            # Anything still routed here is run by the launch system as a launch
+            # entity rather than as a callable, so there is nowhere to put a
+            # watch and retry loop. Recipe methods are diverted to the Monitor
+            # before reaching this point; lifecycle transitions cannot be
+            raise InvalidAction(
+                f"Action '{action.action_name}' cannot be monitored. It is "
+                "executed by the launch system as a launch entity, so its outcome "
+                "cannot be watched. Monitor a component, system-level or recipe "
+                "action instead."
+            )
         self.__update_dict_list(self._ros_events_actions, event.id, action)
         if not self._internal_events:
             self._internal_events = [event]
         elif event not in self._internal_events:
             self._internal_events.append(event)
+
+    def __verify_routine(self, routine: Routine) -> None:
+        """Check that everything a routine runs is reachable from the Monitor.
+
+        :param routine: The routine being routed
+        :type routine: Routine
+        :raises InvalidAction: If an action targets an unknown component, or
+            carries an argument that cannot be sent to it, or another routine
+            already uses the name
+        """
+        # Names identify a routine in its cursor topic and to the control
+        # actions, so two routines cannot share one. The same routine object
+        # registered on several events is fine and is registered once
+        for actions in self._monitor_events_actions.values():
+            for registered in actions:
+                if (
+                    isinstance(registered, Routine)
+                    and registered.name == routine.name
+                    and registered is not routine
+                ):
+                    raise InvalidAction(
+                        f"Got two different routines named '{routine.name}'. Routine "
+                        "names identify a routine in its cursor topic and to the "
+                        "control actions, so they must be unique"
+                    )
+        known_components = [component.node_name for component in self._components]
+        # Every action the routine can run, not only its steps: a fallback or a
+        # terminal action reaching a component the Monitor cannot call fails the
+        # same way, at the worst possible moment
+        for action in routine.actions():
+            owner = action.parent_component
+            if not owner:
+                continue
+            if owner not in known_components:
+                raise InvalidAction(
+                    f"Action '{action.action_name}' of routine '{routine.name}' targets "
+                    f"component '{owner}', which is unknown or not added to the Launcher"
+                )
+            # The Monitor dispatches the action over its component's own
+            # service, which is what makes the process the component runs in
+            # irrelevant, and what makes the arguments have to survive JSON
+            reason = unroutable_arguments(action)
+            if reason:
+                raise InvalidAction(f"In routine '{routine.name}': {reason}")
+
+    def __warn_about_unregistered_ui_routines(self) -> None:
+        """Say so when the UI is given the name of a routine nothing registers.
+
+        A name, rather than a `Routine`, is meant for one that reaches the
+        Monitor another way, such as a routine added at runtime with
+        `add_routine`, so this cannot be an error. A misspelled one, though,
+        leaves a card that never fills and controls the Monitor refuses, with
+        nothing said until somebody presses a button.
+        """
+        config = getattr(self, "_ui_node_config", None)
+        if config is None:
+            # No UI in this recipe, so no routine names to check
+            return
+        registered = {routine.name for routine in self._ui_routines}
+        registered.update(
+            action.name
+            for actions in self._monitor_events_actions.values()
+            for action in actions
+            if isinstance(action, Routine)
+        )
+        unregistered = [
+            name for name in config.routines if name not in registered
+        ]
+        if not unregistered:
+            return
+        logger.warning(
+            f"The UI is given {self.__quoted(unregistered)}, which this recipe "
+            "does not register. A routine nothing registers shows an empty card, "
+            "and its controls are refused, unless it is added at runtime with "
+            "add_routine. This recipe registers "
+            f"{self.__quoted(sorted(registered)) or 'no routines'}"
+        )
+
+    @staticmethod
+    def __quoted(names: List[str]) -> str:
+        """Names as a caller wrote them, for a message that lists them"""
+        return ", ".join(f"'{name}'" for name in names)
 
     def __rewrite_actions_for_components(
         self,
@@ -628,8 +1476,10 @@ class Launcher:
         for event, action_set in events_actions_dict.items():
             bridge_events_per_target: Dict[str, Event] = {}
             for action in action_set:
-                # Verify that the action inputs are available from the event topic(s)
-                if isinstance(action, Action):
+                # Verify that the action inputs are available from the event
+                # topic(s). A routine reports the topics of all of its steps,
+                # so the Monitor subscribes to everything the steps will read
+                if isinstance(action, (Action, Routine)):
                     event.verify_required_action_topics(action)
                 # Callable-based events have their own routing logic
                 if event._is_action_based:
@@ -658,6 +1508,18 @@ class Launcher:
                         )
                 elif isinstance(action, Action) and action._is_monitor_action:
                     # Action to execute through the monitor
+                    self.__update_dict_list(self._monitor_events_actions, event, action)
+                elif isinstance(action, Action) and action.is_monitored:
+                    # A monitored recipe method would otherwise run in the launch
+                    # context, where its return value is discarded and a blocking
+                    # watch would stall the launch loop. The Monitor runs it on its
+                    # own thread instead, which is what the launch context does
+                    # anyway (the LaunchContext handed to an OpaqueFunction is unused)
+                    self.__update_dict_list(self._monitor_events_actions, event, action)
+                elif isinstance(action, Routine):
+                    # A routine spans components, so no component can host it.
+                    # The Monitor is the one node that can reach all of them
+                    self.__verify_routine(action)
                     self.__update_dict_list(self._monitor_events_actions, event, action)
                 elif isinstance(action, Action) or isinstance(action, ROSLaunchAction):
                     # If it is a valid ROS launch action -> nothing is required
@@ -703,6 +1565,16 @@ class Launcher:
             )
             if isinstance(action, Action) and action._is_monitor_action:
                 # Action to execute through the monitor
+                self.__update_dict_list(self._monitor_events_actions, event, action)
+            elif isinstance(action, Action) and action.is_monitored:
+                # Runs in the Monitor rather than the launch context, so its
+                # return value stays visible and a blocking watch cannot stall
+                # the launch loop
+                self.__update_dict_list(self._monitor_events_actions, event, action)
+            elif isinstance(action, Routine):
+                # Hosted by the Monitor, which is the only node that can reach
+                # every component a routine's steps target
+                self.__verify_routine(action)
                 self.__update_dict_list(self._monitor_events_actions, event, action)
             elif isinstance(action, Action) or isinstance(action, ROSLaunchAction):
                 # If it is a valid ROS launch action -> nothing is required
@@ -940,6 +1812,35 @@ class Launcher:
             )
             self._description.add_action(internal_events_handler)
 
+    def _hand_registry_to_monitor(self) -> None:
+        """Give the Monitor the stack's action registry if it was built without one.
+
+        An override of `_init_monitor_node` that builds its own monitor and
+        does not pass the registry on left that monitor knowing only its own
+        methods: every component action was unknown to the runtime API, and
+        nothing said so. A registry the override passed on purpose is kept.
+        """
+        monitor = self.monitor_node
+        if not isinstance(monitor, Monitor) or getattr(
+            monitor, "_registry_given", True
+        ):
+            return
+        # Built again for the monitor actually installed, so the actions of a
+        # subclass are addressable too, and from the components as the override
+        # left them: it may have taken one out to be the monitor itself
+        self._action_registry = SystemActionRegistry.from_components(
+            self._components,
+            monitor_methods=type(monitor).RUNTIME_MONITOR_ACTIONS,
+            monitor_class=type(monitor),
+            out_of_process=list(self._pkg_executable),
+            plugins=list(self._plugins.values()),
+        )
+        monitor.set_action_registry(self._action_registry)
+        logger.debug(
+            f"Monitor '{monitor.node_name}' was built without the action registry, "
+            "handed it the stack's"
+        )
+
     def _init_monitor_node(
         self,
         components_names: List[str],
@@ -949,6 +1850,7 @@ class Launcher:
     ) -> None:
         self.monitor_node = Monitor(
             components_names=components_names,
+            action_registry=self._action_registry,
             events_actions=self._monitor_events_actions,
             events_to_emit=self._internal_events,
             services_components=services_components,
@@ -1004,12 +1906,39 @@ class Launcher:
             ]
         )
 
+        # What the stack can be asked to do by name. Built here because this is
+        # the only place holding every component object together with how each
+        # of them is launched.
+        # NOTE: handed over as an attribute rather than an argument, because
+        # downstream packages override _init_monitor_node to install their own
+        # monitor and a new parameter would break them. An override that does
+        # not pass it on is handed it afterwards, by _hand_registry_to_monitor
+        self._action_registry = SystemActionRegistry.from_components(
+            self._components,
+            monitor_methods=Monitor.RUNTIME_MONITOR_ACTIONS,
+            monitor_class=Monitor,
+            out_of_process=list(self._pkg_executable),
+            # Attached before setup, so what each contributes is addressable
+            plugins=list(self._plugins.values()),
+        )
+
         self._init_monitor_node(
             components_names=components_names,
             services_components=services_components,
             action_components=action_components,
             all_components_to_activate_on_start=all_components_to_activate_on_start,
         )
+        self._hand_registry_to_monitor()
+        # Events the Monitor evaluates may read topics a plugin serves
+        if self._plugins and hasattr(self.monitor_node, "set_plugins"):
+            self.monitor_node.set_plugins(self._plugins)
+
+        # Started by name from the UI, so an event may never route them
+        for routine in self._ui_routines:
+            self.__verify_routine(routine)
+        if self._ui_routines and isinstance(self.monitor_node, Monitor):
+            self.monitor_node.host_routines(self._ui_routines)
+        self.__warn_about_unregistered_ui_routines()
 
         # Register a activation event
         internal_events_handler_activate = launch.actions.RegisterEventHandler(
@@ -1059,10 +1988,11 @@ class Launcher:
         return json.dumps(system_info)
 
     def _setup_ui_node(self) -> None:
-        """Adds a node to communicate between launched components and web client
+        """Creates the node that communicates between the launched components
+        and the web client, and registers it for activation at start.
 
-        :param nodes_in_processes: If nodes are being launched in separate processes, defaults to True
-        :type nodes_in_processes: bool, optional
+        Its launch action is added later by `_add_ui_node_launch_action`, once
+        the plugins are up
         """
         logger.info("UI enabled. Setting up the UI node...")
 
@@ -1075,8 +2005,27 @@ class Launcher:
             outputs=self._ui_output_topics,
             component_configs=component_configs,
         )
-        ui_node._update_cmd_args_list()
+        # A UI topic served by a plugin is bound to it when the UI node
+        # activates, the way a component's is, so it needs the plugins too
+        ui_topics = [
+            topic
+            for topic in list(self._ui_input_topics or []) + list(self._ui_output_topics or [])
+            if isinstance(topic, Topic)
+        ]
+        if any(topic.use_plugin for topic in ui_topics):
+            for plugin in self._plugins.values():
+                ui_node.add_plugin(plugin)
         self.__component_names_to_activate_on_start_mp.append(ui_node.node_name)
+        self._ui_node = ui_node
+
+    def _add_ui_node_launch_action(self) -> None:
+        """Adds the UI node's process to the launch group.
+
+        Runs after `_setup_plugins`, so the plugin specs handed to the UI node
+        point at an already-started feedback bus, as they do for components
+        """
+        ui_node = self._ui_node
+        ui_node._update_cmd_args_list()
         arguments = ui_node.launch_cmd_args + [
             "--additional_types",
             json.dumps(list(_additional_types.keys())),
@@ -1084,6 +2033,8 @@ class Launcher:
             json.dumps(self._ui_input_elements),
             "--ui_output_elements",
             json.dumps(self._ui_output_elements),
+            "--ui_task_elements",
+            json.dumps(self._ui_task_elements),
             "--ui_service_clients",
             ui_node._client_inputs_json,
             "--system_info",
@@ -1105,50 +2056,21 @@ class Launcher:
 
         self._launch_group.append(ui_node)
 
-    def __listen_for_external_processing(self, sock: socket.socket, func: Callable):
-        # Block to accept connections
-        conn, _ = sock.accept()
-        logger.info(f"EXTERNAL PROCESSOR CONNECTED ON {conn}")
-        while True:
-            # TODO: Make the buffer size a parameter
-            # Block to receive data
-
-            try:
-                data = conn.recv(1024)
-                if not data:
-                    continue
-                # TODO: Retrieve errors
-                data = msgpack.unpackb(data)
-                result = func(**data)
-                logger.debug(f"Got result from external processor: {result}")
-                result = msgpack.packb(result)
-                conn.sendall(result)
-            except Exception as e:
-                logger.error(f"Error while running external processor: {e}")
-
     def _setup_external_processors(self, component: BaseComponent) -> None:
+        """Serve the component's external processors to its own process"""
         if not component._external_processors:
             return
 
-        if not self._thread_pool:
-            self._thread_pool = ThreadPoolExecutor()
+        if not self._processor_server:
+            self._processor_server = ExternalProcessorServer()
+            self._processor_server.start()
 
-        for key, processor_data in component._external_processors.items():
-            for processor in processor_data[0]:
-                sock_file = (
-                    f"/tmp/{component.node_name}_{key}_{processor.__name__}.socket"  # type: ignore
+        for key, (processors, _) in component._external_processors.items():
+            for idx, processor in enumerate(processors):
+                self._processor_server.register(
+                    processor_id(component.node_name, key, idx), processor
                 )
-                if os.path.exists(sock_file):
-                    os.remove(sock_file)
-
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.bind(sock_file)
-                s.listen(0)
-                self._thread_pool.submit(
-                    self.__listen_for_external_processing,
-                    s,
-                    processor,  # type: ignore
-                )
+        component._external_processors_endpoint = self._processor_server.endpoint
 
     def _build_component_launch_action(
         self,
@@ -1162,16 +2084,12 @@ class Launcher:
         """
         name = component.node_name
         rclpy_log_level = self._rclpy_log_level.get(component.node_name)
+        arguments = component.launch_cmd_args + [
+            "--additional_types",
+            json.dumps(list(_additional_types.keys())),
+        ]
         if rclpy_log_level:
-            arguments = component.launch_cmd_args + [
-                "--additional_types",
-                json.dumps(list(_additional_types.keys())),
-                "--ros-args",
-                "--log-level",
-                rclpy_log_level,
-            ]
-        else:
-            arguments = component.launch_cmd_args
+            arguments += ["--ros-args", "--log-level", rclpy_log_level]
         if issubclass(component.__class__, ManagedEntity):
             return LifecycleNodeLaunchAction(
                 package=pkg_name,
@@ -1181,6 +2099,7 @@ class Launcher:
                 executable=executable_name,
                 output="screen",
                 arguments=arguments,
+                prefix=component.launch_prefix,
             )
         return NodeLaunchAction(
             package=pkg_name,
@@ -1190,6 +2109,7 @@ class Launcher:
             executable=executable_name,
             output="screen",
             arguments=arguments,
+            prefix=component.launch_prefix,
         )
 
     def _build_exit_handler_entity(
@@ -1296,8 +2216,8 @@ class Launcher:
         :param ros_log_level: Log level for ROS2
         :type ros_log_level: str, default to "info"
         """
-        component._update_cmd_args_list()
         self._setup_external_processors(component)
+        component._update_cmd_args_list()
         new_node = self._build_component_launch_action(
             component, pkg_name, executable_name
         )
@@ -1313,6 +2233,14 @@ class Launcher:
         """
         Adds all components to be launched in separate threads
         """
+        if component.launch_prefix:
+            logger.warning(
+                f"Component '{component.node_name}' sets launch_prefix "
+                f"'{component.launch_prefix}', but runs multithreaded in a launcher "
+                "process with no process of its own, so the prefix has no effect. "
+                "Launch the component's package with multiprocessing=True to "
+                "apply it."
+            )
         component_action = ComponentLaunchAction(
             node=component,
             namespace=self._namespace,
@@ -1324,7 +2252,7 @@ class Launcher:
         )
         self._launch_group.append(component_action)
 
-    def _start_ros_launch(self, introspect: bool = True, debug: bool = False):
+    def _start_ros_launch(self, introspect: bool = True, debug: bool = False) -> int:
         """
         Launch all ros nodes
 
@@ -1332,6 +2260,8 @@ class Launcher:
         :type introspect: bool, optional
         :param debug: LaunchService debugger, defaults to True
         :type debug: bool, optional
+        :return: The launch's return code, non-zero if it failed
+        :rtype: int
         """
         if introspect:
             logger.info("-----------------------------------------------")
@@ -1348,7 +2278,8 @@ class Launcher:
         self.ls = LaunchService(debug=debug)
         self.ls.include_launch_description(self._description)
 
-        self.ls.run(shutdown_when_idle=False)
+        with sigterm_shuts_down(self.ls):
+            return self.ls.run(shutdown_when_idle=False)
 
     def configure(
         self,
@@ -1389,6 +2320,115 @@ class Launcher:
         )
 
         self._description.add_action(exec_process)
+
+    def add_ros_node(
+        self,
+        package: str,
+        executable: str,
+        name: Optional[str] = None,
+        parameters: Optional[List] = None,
+        remappings: Optional[List[Tuple[str, str]]] = None,
+        arguments: Optional[List[str]] = None,
+        output: str = "screen",
+        **launch_node_kwargs,
+    ) -> NodeLaunchAction:
+        """
+        Adds an external ROS2 node to the launcher, to be launched alongside
+        the components (e.g. a MoveIt move_group node, a camera driver).
+
+        The node always runs in its own process and inherits the Launcher
+        namespace (if one is set). The monitor does not track this node, so to
+        restart the node automatically if it dies, pass the launch_ros keyword
+        arguments ``respawn=True`` and optionally ``respawn_delay=<seconds>``.
+
+        :param package: Name of the ROS2 package containing the node executable
+        :type package: str
+        :param executable: Name of the node executable
+        :type executable: str
+        :param name: Node name, defaults to the executable's default name
+        :type name: Optional[str]
+        :param parameters: Node parameters (list of dicts and/or yaml file paths)
+        :type parameters: Optional[List]
+        :param remappings: Topic/service remapping pairs
+        :type remappings: Optional[List[Tuple[str, str]]]
+        :param arguments: Extra command line arguments for the node
+        :type arguments: Optional[List[str]]
+        :param output: Output configuration, defaults to 'screen'
+        :type output: str
+        :param launch_node_kwargs: Additional keyword arguments for launch_ros Node
+        :raises PackageNotFoundError: If the package is not installed
+        :raises FileNotFoundError: If the package has no such executable
+        :return: The created launch action
+        :rtype: launch_ros.actions.Node
+        """
+        _check_ros_executable(package, executable)
+        node_action = NodeLaunchAction(
+            package=package,
+            executable=executable,
+            name=name,
+            parameters=parameters,
+            remappings=remappings,
+            arguments=arguments,
+            output=output,
+            **launch_node_kwargs,
+        )
+        self._description.add_action(node_action)
+        return node_action
+
+    def include_launch_file(
+        self,
+        package: Optional[str],
+        launch_file: str,
+        launch_args: Optional[Dict[str, Any]] = None,
+    ) -> IncludeLaunchDescription:
+        """
+        Includes an external launch file in the launcher, to be brought up
+        alongside the components (e.g. a robot's MoveIt config demo launch).
+
+        Python, XML and YAML launch files are supported. The included
+        description inherits the Launcher namespace (if one is set).
+
+        :param package: Name of the ROS2 package containing the launch file.
+            The file is resolved against the package share directory (directly
+            or under 'launch/'). If None, launch_file is used as a filesystem path
+        :type package: Optional[str]
+        :param launch_file: Launch file name (or path when package is None)
+        :type launch_file: str
+        :param launch_args: Launch arguments passed to the included launch file
+        :type launch_args: Optional[Dict[str, Any]]
+        :raises FileNotFoundError: If the launch file cannot be resolved
+        :return: The created launch action
+        :rtype: launch.actions.IncludeLaunchDescription
+        """
+        if package:
+            from ament_index_python.packages import get_package_share_directory
+
+            share_dir = get_package_share_directory(package)
+            candidates = [
+                os.path.join(share_dir, "launch", launch_file),
+                os.path.join(share_dir, launch_file),
+            ]
+            launch_path = next(
+                (path for path in candidates if os.path.isfile(path)), None
+            )
+            if launch_path is None:
+                raise FileNotFoundError(
+                    f"Launch file '{launch_file}' not found in package "
+                    f"'{package}' (looked in {candidates})"
+                )
+        else:
+            launch_path = launch_file
+            if not os.path.isfile(launch_path):
+                raise FileNotFoundError(f"Launch file '{launch_path}' not found")
+
+        include_action = IncludeLaunchDescription(
+            AnyLaunchDescriptionSource(launch_path),
+            launch_arguments=[
+                (key, str(value)) for key, value in (launch_args or {}).items()
+            ],
+        )
+        self._description.add_action(include_action)
+        return include_action
 
     def add_method(
         self,
@@ -1446,40 +2486,68 @@ class Launcher:
             RegisterEventHandler(OnShutdown(on_shutdown=_mark_shutting_down))
         )
 
-    def _setup_robot_plugin(self) -> None:
-        """Bring up the robot plugin HOST in the launcher process.
+    def _setup_plugins(self) -> None:
+        """Bring every attached plugin up HOST-side in the launcher process.
 
-        Opens the plugin's transports, starts its feedback bus and heartbeats,
-        and wires decoded feedback into the Monitor's event blackboard. Must run
-        after `_setup_monitor_node` (the Monitor must exist) and before the
-        component group is built, so multiprocess components serialize a plugin
-        spec that points at an already-started feedback bus.
+        Opens each plugin's transports, starts the shared feedback bus and the
+        plugins' heartbeats, and wires decoded feedback into the Monitor's
+        event blackboard. Must run after `_setup_monitor_node` (the Monitor
+        must exist) and before the component group is built, so multiprocess
+        components serialize plugin specs that point at an already-started
+        feedback bus.
         """
-        if self._robot_plugin is None:
+        if not self._plugins:
             return
-        plugin = self._robot_plugin
+
+        if self._plugin_hosts:
+            return
+        # Feedback the recipe asked to have on ROS, resolved first so that a
+        # wrong reference fails before any driver is added
+        host_publishes = self._resolve_feedbacks_on_ros()
+        # Record what the recipe asked each plugin for before anything opens
+        self._resolve_plugin_demand()
+
+        # Launch plugin drivers in their own processes (if any). This is done before the feedback bus is started so that the bus is ready to accept connections when the drivers start.
+        # Feedback those drivers read on ROS is published by the plugin's host
+        for plugin in self._plugins.values():
+            host_publishes[plugin.id].extend(self._launch_plugin_processes(plugin))
+        self._check_feedback_topic_clashes(host_publishes)
+
         # A socket feedback bus is needed when any component runs as its own
         # process; otherwise an in-process bus avoids the socket round trip.
         use_socket_bus = bool(self._pkg_executable)
         bus = SocketFeedbackBus() if use_socket_bus else InProcessFeedbackBus()
-        self._robot_plugin_host = RobotPluginHost(
-            plugin,
-            node=self.monitor_node,
-            bus=bus,
-            monitor_feed=self.monitor_node.feed_external_topic,
-        )
-        self._robot_plugin_host.open()
-        # Register every non-ROS feedback's synthetic topic with the Monitor so
-        # events over it are tracked without a ROS subscription. ROS-topic
-        # feedbacks keep a normal ROS subscription (their as_topic() is the real
-        # robot topic), so they are NOT registered as external.
-        for feedback in plugin.feedbacks.values():
-            if not feedback.is_ros_topic:
-                self.monitor_node.register_external_topic(feedback.as_topic())
-        logger.info(
-            f"Robot plugin '{plugin.metadata.name}' active "
-            f"({'socket' if use_socket_bus else 'in-process'} feedback bus)"
-        )
+        # The launcher owns the bus. One bus is shared by every attached plugin,
+        # so it has to outlive any single host
+        self._plugin_bus = bus
+        bus.start()
+        # Shared-memory writer pool for large feedbacks. Only useful on the
+        # socket bus (multiprocess).
+        self._plugin_shm = PluginShmManager() if use_socket_bus else None
+
+        for plugin in self._plugins.values():
+            host = RobotPluginHost(
+                plugin,
+                node=self.monitor_node,
+                bus=bus,
+                monitor_feed=self.monitor_node.feed_external_topic,
+                owns_bus=False,
+                shm=self._plugin_shm,
+            )
+            for feedback_key, topic in host_publishes.get(plugin.id, []):
+                host.publish_on_ros(feedback_key, topic)
+            host.open()
+            self._plugin_hosts.append(host)
+            # Register every non-ROS feedback's synthetic topic with the Monitor
+            # so events over it are tracked without a ROS subscription.
+            # ROS-topic feedbacks keep a normal ROS subscription so they are NOT external.
+            for feedback in plugin.feedbacks.values():
+                if not feedback.is_ros_topic:
+                    self.monitor_node.register_external_topic(feedback.as_topic())
+            logger.info(
+                f"Plugin '{plugin.metadata.name}' active as '{plugin.id}' "
+                f"({'socket' if use_socket_bus else 'in-process'} feedback bus)"
+            )
 
     def setup_launch_description(
         self,
@@ -1502,7 +2570,8 @@ class Launcher:
         for component in self._components:
             self._setup_component_events_handlers(component)
 
-        # Create UI node if enabled
+        # Create UI node if enabled. Its process is added once the plugins
+        # are up, below
         if self._enable_ui:
             self._setup_ui_node()
 
@@ -1511,7 +2580,12 @@ class Launcher:
 
         # Bring up the robot plugin HOST after the Monitor exists and before the
         # component group is built
-        self._setup_robot_plugin()
+        self._setup_plugins()
+
+        if self._enable_ui:
+            self._add_ui_node_launch_action()
+
+        self._publish_mounts()
 
         # Add configured components to launcher
         for component in self._components:
@@ -1548,21 +2622,46 @@ class Launcher:
 
         # If the attached plugin carries a robot_config and the recipe didn't
         # set one, broadcast it to every component
+        self._validate_plugin_references()
+
+        self._distribute_plugins()
+
         self._apply_plugin_robot_config()
+
+        # Before the plugin's body frame, which takes precedence over the recipe's
+        self._apply_recipe_frames()
+
+        self._apply_plugin_base_frame()
 
         if config_file:
             self.configure(config_file)
 
-        self.setup_launch_description()
+        try:
+            self.setup_launch_description()
 
-        self._start_ros_launch(introspect, launch_debug)
+            return_code = self._start_ros_launch(introspect, launch_debug)
+        finally:
+            # Release plugin hosts, bus and shared mem however the launch ends
+            # Tear down every plugin HOST, then the bus they shared
+            for host in self._plugin_hosts:
+                host.close()
+            self._plugin_hosts.clear()
+            if self._plugin_bus is not None:
+                self._plugin_bus.close()
+                self._plugin_bus = None
+            # Unlink the shared-memory segments once the writers (hosts) are down.
+            if self._plugin_shm is not None:
+                self._plugin_shm.close()
+                self._plugin_shm = None
+            # Close external processor server if one was created
+            if self._processor_server:
+                self._processor_server.close()
+                self._processor_server = None
 
-        # Tear down the robot plugin HOST
-        if self._robot_plugin_host is not None:
-            self._robot_plugin_host.close()
-
-        if self._thread_pool:
-            self._thread_pool.shutdown()
+        # Exit with the non-zero code from launch
+        if return_code:
+            logger.error(f"Launch failed with return code {return_code}")
+            sys.exit(return_code)
 
         logger.info("------------------------------------")
         logger.info("ALL COMPONENTS EXITED SUCCESSFULLY")
