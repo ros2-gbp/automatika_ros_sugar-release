@@ -1,22 +1,33 @@
 """ROS Subscribers Callback Classes"""
 
 import os
+import array
 from abc import abstractmethod
 from typing import Any, Callable, Optional, Union, Dict, List
-from socket import socket
 import base64
 
 import cv2
 import numpy as np
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, PoseStamped, PoseWithCovariance, PoseWithCovarianceStamped
 from jinja2.environment import Template
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Header
 from rclpy.logging import get_logger
 from rclpy.subscription import Subscription
 from tf2_ros import TransformStamped
 
 from . import utils
+from .ipc import ExternalProcessorClient
+from .datatypes import (
+    CameraIntrinsics,
+    LaserScanData,
+    PointCloudData,
+    read_camera_info,
+    _get_laserscan_transformed_polar_coordinates,
+    _quaternion_multiply,
+    _rotation_matrix_from_quaternion,
+)
 
 
 class GenericCallback:
@@ -33,6 +44,9 @@ class GenericCallback:
 
         self.input_topic = input_topic
 
+        # check for constant input (embodied-agents)
+        self._is_fixed = hasattr(input_topic, "fixed")
+
         # Node name can be changed to a node that the callback is executed in
         # at the time of setting subscriber using set_node_name
         self.node_name: str = node_name
@@ -42,10 +56,20 @@ class GenericCallback:
         # Coordinates frame of the message data (if available)
         self._frame_id: Optional[str] = None
 
+        # Transform applied to the data before it is handed to the component.
+        # Populated from `_transform_provider` on every message when the
+        # component asked for this input in a specific frame.
+        self._transformation: Optional[TransformStamped] = None
+        self._transform_provider: Optional[
+            Callable[["GenericCallback"], Optional[TransformStamped]]
+        ] = None
+
         self._extra_callback: Optional[Callable] = None
         self._get_processed: bool = True  # utilized only if extra callback is set
         self._subscriber: Optional[Subscription] = None
-        self._post_processors: Optional[List[Union[Callable, socket]]] = None
+        self._post_processors: Optional[
+            List[Union[Callable, ExternalProcessorClient]]
+        ] = None
 
     @property
     def frame_id(self) -> Optional[str]:
@@ -55,6 +79,40 @@ class GenericCallback:
         :rtype: Optional[str]
         """
         return self._frame_id
+
+    @property
+    def transformation(self) -> Optional[TransformStamped]:
+        """Getter of the transformation applied to the data
+
+        :return: Transformation from the message frame to the requested frame
+        :rtype: Optional[TransformStamped]
+        """
+        return self._transformation
+
+    @transformation.setter
+    def transformation(self, transform: Optional[TransformStamped]) -> None:
+        """
+        Sets a new transformation value
+
+        :param transform: Transformation to apply to the data
+        :type transform: Optional[TransformStamped]
+        """
+        self._transformation = transform
+
+    def set_transform_provider(
+        self,
+        provider: Optional[Callable[["GenericCallback"], Optional[TransformStamped]]],
+    ) -> None:
+        """Attach a resolver called on every message to refresh `transformation`.
+
+        The provider is given this callback (so it can read `frame_id`, which is
+        only known once data arrives) and returns the transform to apply, or
+        None if it is not available yet.
+
+        :param provider: Transform resolver
+        :type provider: Optional[Callable[[GenericCallback], Optional[TransformStamped]]]
+        """
+        self._transform_provider = provider
 
     def set_node_name(self, node_name: str) -> None:
         """Set node name.
@@ -96,6 +154,11 @@ class GenericCallback:
         if hasattr(msg, "header") and isinstance(msg.header, Header):
             self._frame_id = msg.header.frame_id
 
+        # Refresh the transform before any output is produced below, since the
+        # source frame is only known now that a message has arrived
+        if self._transform_provider is not None:
+            self._transformation = self._transform_provider(self)
+
         if self._extra_callback:
             if self._get_processed:
                 self._extra_callback(
@@ -105,11 +168,13 @@ class GenericCallback:
                 # Get output would have to be called by the calling method
                 self._extra_callback(msg=msg, topic=self.input_topic)
 
-    def add_post_processors(self, processors: List[Union[Callable, socket]]):
+    def add_post_processors(
+        self, processors: List[Union[Callable, ExternalProcessorClient]]
+    ):
         """Add a post processor for callback message
 
-        :param method: Post processor methods or sockets
-        :type method: List[Union[Callable, socket]]
+        :param method: Post processor methods or clients calling them in the launcher process
+        :type method: List[Union[Callable, ExternalProcessorClient]]
         """
         self._post_processors = processors
 
@@ -160,7 +225,7 @@ class GenericCallback:
         :returns:   Topic content
         :rtype:     Any
         """
-        return self.get_output(clear_last=True)
+        return self.get_output()
 
     @property
     def got_msg(self):
@@ -171,6 +236,8 @@ class GenericCallback:
 
     def clear_last_msg(self):
         """Clears the last received message on the topic"""
+        if self._is_fixed:
+            return
         self.msg = None
 
 
@@ -227,6 +294,11 @@ class StdMsgArrayCallback(GenericCallback):
         except Exception as e:
             raise ValueError(f"Failed to parse MultiArray message: {str(e)}") from e
 
+    def _get_ui_content(self, **_) -> Optional[List]:
+        """Get JSON-serializable UI content for a MultiArray."""
+        output = self.get_output()
+        return output.tolist() if output is not None else None
+
 
 class ImageCallback(GenericCallback):
     """
@@ -240,8 +312,8 @@ class ImageCallback(GenericCallback):
         :type       input_topic:  Input
         """
         super().__init__(input_topic, node_name)
-        # fixed image needs to be a path to cv2 readable image
-        if hasattr(input_topic, "fixed"):
+        # fixed image needs to be a path to cv2 readable image (from embodied-agents)
+        if self._is_fixed:
             if os.path.isfile(input_topic.fixed):
                 try:
                     _image = cv2.imread(input_topic.fixed)
@@ -263,7 +335,7 @@ class ImageCallback(GenericCallback):
         :returns:   Image as bytes
         :rtype:     bytes
         """
-        if not self.msg:
+        if self.msg is None:
             return None
 
         # return bytes if fixed image has been read
@@ -292,7 +364,7 @@ class CompressedImageCallback(ImageCallback):
         :returns:   Image as bytes
         :rtype:     bytes
         """
-        if not self.msg:
+        if self.msg is None:
             return None
 
         # return bytes if fixed image has been read
@@ -318,7 +390,7 @@ class TextCallback(GenericCallback):
         :type       input_topic:  str
         """
         super().__init__(input_topic, node_name)
-        self.msg = input_topic.fixed if hasattr(input_topic, "fixed") else None
+        self.msg = input_topic.fixed if self._is_fixed else None
         self._template: Optional[Template] = None
 
     def _get_output(self, **_) -> Optional[str]:
@@ -353,7 +425,7 @@ class AudioCallback(GenericCallback):
         :type       input_topic:  str
         """
         super().__init__(input_topic, node_name)
-        if hasattr(input_topic, "fixed"):
+        if self._is_fixed:
             if os.path.isfile(input_topic.fixed):
                 try:
                     with open(input_topic.fixed, "rb") as wavfile:
@@ -413,7 +485,7 @@ class MapMetaDataCallback(GenericCallback):
         :type       input_topic:  str
         """
         super().__init__(input_topic, node_name)
-        self.msg = input_topic.fixed if hasattr(input_topic, "fixed") else None
+        self.msg = input_topic.fixed if self._is_fixed else None
 
     def _get_output(self, **_) -> Optional[Dict]:
         """
@@ -445,33 +517,12 @@ class OdomCallback(GenericCallback):
         node_name: str = "",
     ) -> None:
         super().__init__(input_topic, node_name)
-        self.__tf: Optional[TransformStamped] = None
-
-    @property
-    def transformation(self) -> Optional[TransformStamped]:
-        """
-        Sets a new transformation value
-
-        :return:  Detected transform from source to desired goal frame
-        :rtype: TransformStamped
-        """
-        return self.__tf
-
-    @transformation.setter
-    def transformation(self, transform: TransformStamped) -> None:
-        """
-        Sets a new transformation value
-
-        :param transform: Detected transform from source to desired goal frame
-        :type transform: TransformStamped
-        """
-        self.__tf = transform
 
     def _get_output(self, **_) -> Optional[np.ndarray]:
         """
         Get position data.
         """
-        if not self.msg:
+        if self.msg is None:
             return None
         # send fixed position array if it exists
         if isinstance(self.msg, np.ndarray):
@@ -492,7 +543,11 @@ class OdomCallback(GenericCallback):
         :returns:   Topic content
         :rtype:     Any
         """
-        return {"frame_id": self.frame_id, "data": self.get_output(clear_last=True)}
+        output = self.get_output()
+        return {
+            "frame_id": self.frame_id,
+            "data": output.tolist() if output is not None else None,
+        }
 
     def _process(self, msg: Odometry) -> np.ndarray:
         """Takes Odometry ROS object and converts it to a numpy array with [x, y, z, heading, speed]
@@ -507,7 +562,7 @@ class OdomCallback(GenericCallback):
             msg.pose.pose.orientation.z, msg.pose.pose.orientation.w
         )
 
-        speed = np.sqrt(msg.twist.twist.linear.y**2 + msg.twist.twist.linear.y**2)
+        speed = np.sqrt(msg.twist.twist.linear.x**2 + msg.twist.twist.linear.y**2)
 
         position = msg.pose.pose.position
 
@@ -530,6 +585,7 @@ class OdomCallback(GenericCallback):
         odom_in_map_pose_data.pose.pose.position.y = transform.transform.translation.y
         odom_in_map_pose_data.pose.pose.position.z = transform.transform.translation.z
         odom_in_map_pose_data.pose.pose.orientation = transform.transform.rotation
+        odom_in_map_pose_data.twist.twist = msg.twist.twist
 
         odom_in_goal_pose_data: Odometry = utils.odom_from_frame1_to_frame2(
             pose_1_in_2=odom_in_map_pose_data, pose_target_in_1=msg
@@ -545,7 +601,7 @@ class PointCallback(GenericCallback):
     def __init__(
         self,
         input_topic,
-        node_name: str = '',
+        node_name: str = "",
     ) -> None:
         super().__init__(input_topic, node_name)
 
@@ -568,7 +624,138 @@ class PointCallback(GenericCallback):
         :returns:   Topic content
         :rtype:     Any
         """
-        return {"data": self.get_output(clear_last=True)}
+        output = self.get_output()
+        return {"data": output.tolist() if output is not None else None}
+
+
+class JointStateCallback(GenericCallback):
+    """
+    sensor_msgs/JointState callback.
+
+    Returns the joint positions as a numpy array, ordered as the incoming
+    message's ``name`` field.
+    """
+
+    def _get_output(self, **_) -> Optional[np.ndarray]:
+        """
+        Gets the joint positions as a numpy array.
+
+        :returns:   joint positions (rad or m), ordered as ``msg.name``
+        :rtype:     Optional[np.ndarray]
+        """
+        if not self.msg:
+            return None
+
+        return np.array(self.msg.position, dtype=np.float64)
+
+    def _get_ui_content(self, **_) -> Dict:
+        """Positions under ``data``, with the joint names, velocities and efforts"""
+        return {
+            "data": list(self.msg.position),
+            "names": list(self.msg.name),
+            "velocities": list(self.msg.velocity),
+            "efforts": list(self.msg.effort),
+        }
+
+
+class ImuCallback(GenericCallback):
+    """
+    sensor_msgs/Imu callback.
+
+    Returns the IMU state as a flat numpy array
+    ``[qx, qy, qz, qw, wx, wy, wz, ax, ay, az]`` -- orientation quaternion,
+    angular velocity (rad/s) and linear acceleration (m/s^2).
+    """
+
+    def _get_output(self, **_) -> Optional[np.ndarray]:
+        """
+        Gets the IMU state as a numpy array.
+
+        :returns:   [qx, qy, qz, qw, wx, wy, wz, ax, ay, az]
+        :rtype:     Optional[np.ndarray]
+        """
+        if not self.msg:
+            return None
+
+        o = self.msg.orientation
+        w = self.msg.angular_velocity
+        a = self.msg.linear_acceleration
+        return np.array(
+            [o.x, o.y, o.z, o.w, w.x, w.y, w.z, a.x, a.y, a.z], dtype=np.float64
+        )
+
+    def _get_ui_content(self, **_) -> Dict:
+        """
+        Utility method to get UI compatible content.
+        To be used with external callbacks in UI Node
+        :returns:   Topic content
+        :rtype:     Any
+        """
+        output = self.get_output()
+        return {"data": output.tolist() if output is not None else None}
+
+
+class NavSatFixCallback(GenericCallback):
+    """
+    sensor_msgs/NavSatFix callback.
+
+    Returns the satellite fix as a numpy array ``[latitude, longitude,
+    altitude]`` (degrees, degrees, metres).
+    """
+
+    def _get_output(self, **_) -> Optional[np.ndarray]:
+        """
+        Gets the satellite fix as a numpy array.
+
+        :returns:   [latitude, longitude, altitude]
+        :rtype:     Optional[np.ndarray]
+        """
+        if not self.msg:
+            return None
+
+        return np.array(
+            [self.msg.latitude, self.msg.longitude, self.msg.altitude],
+            dtype=np.float64,
+        )
+
+    def _get_ui_content(self, **_) -> Dict:
+        """
+        Utility method to get UI compatible content.
+        To be used with external callbacks in UI Node
+        :returns:   Topic content
+        :rtype:     Any
+        """
+        output = self.get_output()
+        return {"data": output.tolist() if output is not None else None}
+
+
+class RangeCallback(GenericCallback):
+    """
+    sensor_msgs/Range callback.
+
+    Returns the measured distance in metres (the message's ``range`` field).
+    """
+
+    def _get_output(self, **_) -> Optional[float]:
+        """
+        Gets the measured range as a float.
+
+        :returns:   distance in metres
+        :rtype:     Optional[float]
+        """
+        if not self.msg:
+            return None
+
+        return float(self.msg.range)
+
+    def _get_ui_content(self, **_) -> Dict:
+        """
+        Utility method to get UI compatible content.
+        To be used with external callbacks in UI Node
+        :returns:   Topic content
+        :rtype:     Any
+        """
+        return {"data": self.get_output()}
 
 
 class PointStampedCallback(GenericCallback):
@@ -579,7 +766,7 @@ class PointStampedCallback(GenericCallback):
     def __init__(
         self,
         input_topic,
-        node_name: str = '',
+        node_name: str = "",
     ) -> None:
         super().__init__(input_topic, node_name)
 
@@ -602,7 +789,11 @@ class PointStampedCallback(GenericCallback):
         :returns:   Topic content
         :rtype:     Any
         """
-        return {"frame_id": self.frame_id, "data": self.get_output(clear_last=True)}
+        output = self.get_output()
+        return {
+            "frame_id": self.frame_id,
+            "data": output.tolist() if output is not None else None,
+        }
 
 
 class PoseCallback(GenericCallback):
@@ -613,30 +804,9 @@ class PoseCallback(GenericCallback):
     def __init__(
         self,
         input_topic,
-        node_name: str = '',
+        node_name: str = "",
     ) -> None:
         super().__init__(input_topic, node_name)
-        self.__tf: Optional[TransformStamped] = None
-
-    @property
-    def transformation(self) -> Optional[TransformStamped]:
-        """
-        Sets a new transformation value
-
-        :return:  Detected transform from source to desired goal frame
-        :rtype: TransformStamped
-        """
-        return self.__tf
-
-    @transformation.setter
-    def transformation(self, transform: TransformStamped) -> None:
-        """
-        Sets a new transformation value
-
-        :param transform: Detected transform from source to desired goal frame
-        :type transform: TransformStamped
-        """
-        self.__tf = transform
 
     def _process(self, msg: Pose) -> np.ndarray:
         """Takes Pose ROS object and converts it to a numpy array with [x, y, z, heading]
@@ -707,7 +877,46 @@ class PoseCallback(GenericCallback):
         :returns:   Topic content
         :rtype:     Any
         """
-        return {"data": self.get_output(clear_last=True)}
+        output = self.get_output()
+        return {"data": output.tolist() if output is not None else None}
+
+
+class PoseWithCovarianceCallback(PoseCallback):
+    """
+    Ros PoseWithCovariance Callback Handler to get the robot state in 2D
+    """
+
+    def __init__(
+        self,
+        input_topic,
+        node_name: str = "",
+    ) -> None:
+        super().__init__(input_topic, node_name)
+
+    def _process(self, msg: PoseWithCovariance) -> np.ndarray:
+        """Takes PoseWithCovariance ROS object and converts it to a numpy array with [x, y, z, heading]
+
+        :param msg: Input ROS PoseWithCovariance message
+        :type msg: PoseWithCovariance
+
+        :return: [x, y, z, heading]
+        :rtype: np.ndarray
+        """
+        return PoseCallback._process(self, msg.pose)
+
+    def _transform(self, msg: PoseWithCovariance, transform: TransformStamped) -> Pose:
+        """
+        Applies a transform to a given Odometry message
+
+        :param msg: Pose message in source frame
+        :type msg: Pose
+        :param transform: Pose transform from current to goal frame
+        :type transform: TransformStamped
+
+        :return: Pose data in new frame
+        :rtype: Pose
+        """
+        return PoseCallback._transform(self, msg.pose, transform)
 
 
 class PoseStampedCallback(PoseCallback):
@@ -718,7 +927,7 @@ class PoseStampedCallback(PoseCallback):
     def __init__(
         self,
         input_topic,
-        node_name: str = '',
+        node_name: str = "",
     ) -> None:
         super().__init__(input_topic, node_name)
 
@@ -747,20 +956,192 @@ class PoseStampedCallback(PoseCallback):
         :returns:   Topic content
         :rtype:     Any
         """
-        return {"frame_id": self.frame_id, "data": self.get_output(clear_last=True)}
+        output = self.get_output()
+        return {
+            "frame_id": self.frame_id,
+            "data": output.tolist() if output is not None else None,
+        }
 
 
-class PathCallback(GenericCallback):
+class PoseWithCovarianceStampedCallback(PoseWithCovarianceCallback):
     """
-    Ros PoseStamped Callback Handler to get the robot state in 2D
+    Ros PoseWithCovarianceStamped Callback Handler to get the robot state in 2D
     """
 
     def __init__(
         self,
         input_topic,
-        node_name: str = '',
+        node_name: str = "",
     ) -> None:
         super().__init__(input_topic, node_name)
+
+    def _process(self, msg: PoseWithCovarianceStamped) -> np.ndarray:
+        """Takes PoseWithCovarianceStamped ROS object and converts it to a numpy array with [x, y, z, heading]
+
+        :param msg: Input ROS PoseWithCovarianceStamped message
+        :type msg: PoseWithCovarianceStamped
+
+        :return: [x, y, z, heading]
+        :rtype: np.ndarray
+        """
+        return PoseWithCovarianceCallback._process(self, msg.pose)
+
+    def _transform(self, msg: PoseWithCovarianceStamped, transform: TransformStamped) -> Pose:
+        """
+        Applies a transform to a given Odometry message
+
+        :param msg: Pose message in source frame
+        :type msg: Pose
+        :param transform: Pose transform from current to goal frame
+        :type transform: TransformStamped
+
+        :return: Pose data in new frame
+        :rtype: Pose
+        """
+        return PoseWithCovarianceCallback._transform(self, msg.pose, transform)
+
+
+class PoseArrayCallback(GenericCallback):
+    """
+    Ros PoseArray Callback Handler to get a set of poses as a numpy array
+    """
+
+    def __init__(
+        self,
+        input_topic,
+        node_name: str = "",
+    ) -> None:
+        super().__init__(input_topic, node_name)
+
+    def _get_output(self, **_) -> Optional[np.ndarray]:
+        """
+        Gets the PoseArray message as a numpy array with one row per pose.
+        The coordinates frame of the poses is available in the callback
+        `frame_id`
+
+        :returns:   Nx4 array of [x, y, z, heading] rows
+        :rtype:     Optional[np.ndarray]
+        """
+        if not self.msg:
+            return None
+
+        return np.array([
+            [
+                pose.position.x,
+                pose.position.y,
+                pose.position.z,
+                2 * np.arctan2(pose.orientation.z, pose.orientation.w),
+            ]
+            for pose in self.msg.poses
+        ])
+
+    def _get_ui_content(self, **_) -> Dict:
+        """
+        Utility method to get UI compatible content.
+        To be used with external callbacks in UI Node
+        :returns:   Topic content
+        :rtype:     Any
+        """
+        output = self.get_output()
+        return {
+            "frame_id": self.frame_id,
+            "data": output.tolist() if output is not None else None,
+        }
+
+
+class PathCallback(GenericCallback):
+    """
+    Ros Path Callback Handler to get a navigation path
+    """
+
+    def __init__(
+        self,
+        input_topic,
+        node_name: str = "",
+        transformation: Optional[TransformStamped] = None,
+    ) -> None:
+        super().__init__(input_topic, node_name)
+        self._transformation = transformation
+
+    def _get_output(
+        self,
+        transformation: Optional[TransformStamped] = None,
+    ) -> Optional[Path]:
+        """
+        Gets the path by applying the transformation if given.
+
+        :param transformation: Transform to the goal frame, overriding the one
+            set on the callback
+        :type transformation: Optional[TransformStamped]
+
+        :returns:   Topic content
+        :rtype:     Optional[Path]
+        """
+        if not self.msg:
+            return None
+        transform = transformation or self.transformation
+        if not transform or transform.header.frame_id == self.msg.header.frame_id:
+            # Nothing asked for, or the path is already in the goal frame and
+            # rebuilding every pose would be an expensive no-op
+            return self.msg
+        return self._transform(self.msg, transform)
+
+    def _transform(self, msg: Path, transform: TransformStamped) -> Path:
+        """
+        Applies a transform to every pose of a given Path message
+
+        A path can carry hundreds of poses, so the positions are transformed
+        as one array rather than pose by pose. Orientations are composed with
+        the transform's rotation so headings stay consistent with positions.
+
+        :param msg: Path message in source frame
+        :type msg: Path
+        :param transform: Path transform from current to goal frame
+        :type transform: TransformStamped
+
+        :return: Path in goal frame
+        :rtype: Path
+        """
+        trans = transform.transform.translation
+        quat = transform.transform.rotation
+        rotation = [quat.x, quat.y, quat.z, quat.w]
+
+        positions = np.array(
+            [
+                [pose.pose.position.x, pose.pose.position.y, pose.pose.position.z]
+                for pose in msg.poses
+            ],
+            dtype=np.float32,
+        ).reshape(-1, 3) @ _rotation_matrix_from_quaternion(rotation).T + np.array(
+            [trans.x, trans.y, trans.z], dtype=np.float32
+        )
+
+        transformed = Path()
+        transformed.header.stamp = msg.header.stamp
+        transformed.header.frame_id = transform.header.frame_id
+        for pose_in, position in zip(msg.poses, positions):
+            pose_out = PoseStamped()
+            pose_out.header.stamp = pose_in.header.stamp
+            pose_out.header.frame_id = transform.header.frame_id
+            pose_out.pose.position.x = float(position[0])
+            pose_out.pose.position.y = float(position[1])
+            pose_out.pose.position.z = float(position[2])
+            orientation = _quaternion_multiply(
+                rotation,
+                [
+                    pose_in.pose.orientation.x,
+                    pose_in.pose.orientation.y,
+                    pose_in.pose.orientation.z,
+                    pose_in.pose.orientation.w,
+                ],
+            )
+            pose_out.pose.orientation.x = float(orientation[0])
+            pose_out.pose.orientation.y = float(orientation[1])
+            pose_out.pose.orientation.z = float(orientation[2])
+            pose_out.pose.orientation.w = float(orientation[3])
+            transformed.poses.append(pose_out)
+
+        return transformed
 
     def _get_ui_content(self, **_) -> Dict:
         """
@@ -811,23 +1192,42 @@ class OccupancyGridCallback(GenericCallback):
     def __init__(
         self,
         input_topic,
-        node_name: str = '',
+        node_name: str = "",
         to_numpy: bool = True,
         twoD_to_threeD_conversion_height: float = 0.01,
+        transformation: Optional[TransformStamped] = None,
     ) -> None:
         super().__init__(input_topic, node_name)
         self.__to_numpy = to_numpy
         self.__twoD_to_threeD_conversion_height = twoD_to_threeD_conversion_height
+        self._transformation = transformation
 
     def _get_output(
         self,
         get_metadata: bool = False,
         get_obstacles: bool = True,
         get_three_d: bool = True,
-        **_,
+        transformation: Optional[TransformStamped] = None,
     ) -> Optional[Union[OccupancyGrid, np.ndarray, Dict]]:
         """
         Gets the OccupancyGrid message raw or as a numpy array
+
+        The grid's own `info.origin` is always applied to the obstacle
+        coordinates: cell indices mean nothing without it, and it is what
+        places them in the frame the message declares. `transformation` is
+        applied on top of that, to carry them into a different frame.
+
+        :param get_metadata: Return the grid metadata instead of its content.
+            The origin it reports is the message's own, never transformed
+        :type get_metadata: bool
+        :param get_obstacles: Return the occupied cells' coordinates rather
+            than the raw 2D grid. Only these are transformed
+        :type get_obstacles: bool
+        :param get_three_d: Pad the coordinates to 3D at a fixed height
+        :type get_three_d: bool
+        :param transformation: Transform to the goal frame, overriding the one
+            set on the callback
+        :type transformation: Optional[TransformStamped]
 
         :returns:   Map as an OccupancyGrid or numpy array
         :rtype:     Optional[Union[OccupancyGrid, np.ndarray]]
@@ -872,36 +1272,385 @@ class OccupancyGridCallback(GenericCallback):
             np.array(np.where(grid_data != 0), dtype=np.float32) + 0.5
         ) * self.msg.info.resolution
 
-        rotation_matrix = np.array([
-            [np.cos(origin_yaw), -np.sin(origin_yaw)],
-            [np.sin(origin_yaw), np.cos(origin_yaw)],
-        ])
-
-        transformed_coordinates = np.array([origin_x, origin_y]) + np.transpose(
-            rotation_matrix @ occupied_coordinates
+        # create a float32 rotation matrix
+        rotation_matrix = np.array(
+            [
+                [np.cos(origin_yaw), -np.sin(origin_yaw)],
+                [np.sin(origin_yaw), np.cos(origin_yaw)],
+            ],
+            dtype=np.float32,
         )
 
-        if not get_three_d:
-            return transformed_coordinates
+        # Build the output C-contiguous
+        num_points = occupied_coordinates.shape[1]
+        num_coordinates = 2 if not get_three_d else 3
+        coordinates = np.empty((num_points, num_coordinates), dtype=np.float32)
+        coordinates[:, :2] = (rotation_matrix @ occupied_coordinates).T
+        coordinates[:, 0] += origin_x
+        coordinates[:, 1] += origin_y
+        if get_three_d:
+            coordinates[:, 2] = self.__twoD_to_threeD_conversion_height
 
-        threeD_coordinates = np.pad(
-            transformed_coordinates,
-            ((0, 0), (0, 1)),
-            mode="constant",
-            constant_values=self.__twoD_to_threeD_conversion_height,
+        transform = transformation or self.transformation
+        if transform and transform.header.frame_id != self.msg.header.frame_id:
+            trans = transform.transform.translation
+            quat = transform.transform.rotation
+            # A 2D request has already dropped z, so it can only carry the
+            # planar block of the rotation. That block is the whole rotation
+            # only for a yaw-only transform; roll or pitch would move points
+            # out of the plane, which a 2D map cannot represent anyway
+            goal_rotation = _rotation_matrix_from_quaternion([
+                quat.x,
+                quat.y,
+                quat.z,
+                quat.w,
+            ])[:num_coordinates, :num_coordinates]
+            # Written back in place so the output stays C-contiguous
+            coordinates[:] = coordinates @ goal_rotation.T
+            coordinates[:, 0] += trans.x
+            coordinates[:, 1] += trans.y
+            if get_three_d:
+                coordinates[:, 2] += trans.z
+
+        return coordinates
+
+    def _get_ui_content(self, **_) -> Optional[Dict]:
+        """Get UI content for an occupancy grid.
+
+        Returns only what a map renderer needs -- frame, metadata (resolution,
+        size, origin) and the occupancy data (base64-encoded int8) -- not a
+        rendered image and not the unused header/stamp fields.
+        """
+        if not self.msg:
+            return None
+        data = self.msg.data
+        if isinstance(data, array.array):
+            raw_bytes = data.tobytes()
+        elif isinstance(data, (bytes, bytearray)):
+            raw_bytes = bytes(data)
+        else:
+            # list (or other array-like) of int8
+            raw_bytes = array.array("b", list(data)).tobytes()
+        return {
+            "frame_id": self.frame_id,
+            **self._get_output(get_metadata=True),
+            "data": base64.b64encode(raw_bytes).decode("ascii"),
+        }
+
+
+class LaserScanCallback(GenericCallback):
+    """ROS2 LaserScan Callback Handler to process and transform sensor_msgs/LaserScan data"""
+
+    def __init__(
+        self,
+        input_topic,
+        node_name: str = "",
+        transformation: Optional[TransformStamped] = None,
+    ) -> None:
+        super().__init__(input_topic, node_name)
+        self._transformation = transformation
+
+    def _get_output(
+        self,
+        transformation: Optional[TransformStamped] = None,
+    ) -> Optional[LaserScanData]:
+        """
+        Gets the laserscan data by applying the transformation if given.
+
+        :param transformation: Transform to the goal frame, overriding the one
+            set on the callback
+        :type transformation: Optional[TransformStamped]
+
+        :returns:   Topic content
+        :rtype:     Optional[LaserScanData]
+        """
+        if not self.msg:
+            return None
+        if transformation or self.transformation:
+            laser_scan_data = self._transform(
+                self.msg, transformation or self.transformation
+            )
+        else:
+            laser_scan_data = self._process(self.msg)
+
+        laser_scan_data.frame_id = self.msg.header.frame_id
+        laser_scan_data.timestamp = (
+            self.msg.header.stamp.sec + self.msg.header.stamp.nanosec * 1e-9
+        )
+        return laser_scan_data
+
+    def __clipped_ranges(self, msg: LaserScan) -> np.ndarray:
+        """Replaces NaN values and clips the ranges of a scan to [0, range_max]
+
+        :param msg: Input ROS LaserScan message
+        :type msg: LaserScan
+        :rtype: np.ndarray
+        """
+        _no_nan_ranges = np.nan_to_num(msg.ranges, nan=msg.range_max)
+        return _no_nan_ranges.clip(min=0.0, max=msg.range_max)
+
+    def _process(self, msg: LaserScan) -> LaserScanData:
+        """
+        Takes LaserScan ROS message and converts it to LaserScanData
+        :return: LaserScanData
+        """
+        return LaserScanData(
+            angle_min=msg.angle_min,
+            angle_max=msg.angle_max,
+            angle_increment=msg.angle_increment,
+            time_increment=msg.time_increment,
+            scan_time=msg.scan_time,
+            range_min=msg.range_min,
+            range_max=max(msg.range_max, 1e-3),
+            ranges=self.__clipped_ranges(msg),
+            intensities=np.array(msg.intensities),
         )
 
-        return threeD_coordinates
+    def _transform(self, msg: LaserScan, transform: TransformStamped) -> LaserScanData:
+        """
+        Applies a transform to a given LaserScan message and converts it to LaserScanData
+
+        :param msg: LaserScan message in source frame
+        :type msg: LaserScan
+        :param transform: LaserScan transform from current to goal frame
+        :type transform: TransformStamped
+
+        :return: LaserScanData in goal frame
+        :rtype: LaserScanData
+        """
+        trans = transform.transform.translation
+        quat = transform.transform.rotation
+
+        # Get the transformed laser scan data
+        laserscan_transformed = _get_laserscan_transformed_polar_coordinates(
+            angle_min=msg.angle_min,
+            angle_max=msg.angle_max,
+            angle_increment=msg.angle_increment,
+            laser_scan_ranges=self.__clipped_ranges(msg),
+            max_scan_range=msg.range_max,
+            translation=[trans.x, trans.y, trans.z],
+            rotation=[quat.x, quat.y, quat.z, quat.w],
+            intensities=np.array(msg.intensities),
+        )
+
+        laserscan_transformed.time_increment = msg.time_increment
+        laserscan_transformed.scan_time = msg.scan_time
+
+        return laserscan_transformed
+
+    def _get_ui_content(self, **_) -> Dict:
+        """
+        Utility method to get UI compatible content.
+        To be used with external callbacks in UI Node
+        :returns:   Topic content
+        :rtype:     Any
+        """
+        # NOTE: Only sending metadata until browser front-end has a consumer
+        if not self.msg:
+            return {"frame_id": self.frame_id, "data": None}
+        return {
+            "frame_id": self.frame_id,
+            "data": {
+                "angle_min": self.msg.angle_min,
+                "angle_max": self.msg.angle_max,
+                "num_points": len(self.msg.ranges),
+            },
+        }
+
+
+class PointCloudCallback(GenericCallback):
+    """ROS2 PointCloud2 Callback Handler to process sensor_msgs/PointCloud2 data"""
+
+    def __init__(
+        self,
+        input_topic,
+        node_name: str = "",
+        transformation: Optional[TransformStamped] = None,
+    ) -> None:
+        super().__init__(input_topic, node_name)
+        self._transformation = transformation
+
+    def _get_output(
+        self,
+        transformation: Optional[TransformStamped] = None,
+        min_z: Optional[float] = None,
+        max_z: Optional[float] = None,
+        discard_underground: bool = False,
+        get_2d: bool = False,
+    ) -> Optional[PointCloudData]:
+        """Gets the PointCloud2 message data as a PointCloudData container
+        with the raw buffer, layout metadata and lazy cartesian decoding.
+
+
+        :param transformation: Transform to the goal frame, overriding the one
+            set on the callback
+        :type transformation: Optional[TransformStamped]
+        :param min_z: Drop points below this height, in the goal frame
+        :type min_z: Optional[float]
+        :param max_z: Drop points above this height, in the goal frame
+        :type max_z: Optional[float]
+        :param discard_underground: Drop points below the ground plane, which
+            the transform's z translation locates
+        :type discard_underground: bool
+        :param get_2d: Flatten the surviving points onto z = 0
+        :type get_2d: bool
+
+        :return: Return PointCloudData
+        :rtype: Optional[PointCloudData]
+        """
+        pc = self._container()
+        if pc is None:
+            return None
+
+        transform = transformation or self.transformation
+        if not (
+            transform
+            or min_z is not None
+            or max_z is not None
+            or discard_underground
+            or get_2d
+        ):
+            # Nothing asked for: hand back the raw buffer, decoding nothing
+            return pc
+
+        if discard_underground and transform is None:
+            get_logger(self.node_name or "PointCloudCallback").warning(
+                f"'discard_underground' was requested for topic "
+                f"'{self.input_topic.name}' but no transform to the robot body "
+                "is set, so the ground plane cannot be located. Ignoring it. "
+                "Call 'transform_input_to' on the component to provide one.",
+                once=True,
+            )
+
+        translation = rotation = goal_frame = None
+        if transform:
+            trans = transform.transform.translation
+            quat = transform.transform.rotation
+            translation = [trans.x, trans.y, trans.z]
+            rotation = [quat.x, quat.y, quat.z, quat.w]
+            goal_frame = transform.header.frame_id
+
+        return pc.filtered(
+            translation=translation,
+            rotation=rotation,
+            frame_id=goal_frame,
+            min_z=min_z,
+            max_z=max_z,
+            discard_underground=discard_underground,
+            get_2d=get_2d,
+        )
+
+    def _container(self) -> Optional[PointCloudData]:
+        """Wrap the current message's raw buffer and layout, without decoding.
+
+        :return: The cloud as received, or None if it is empty or has no
+            x/y/z fields
+        :rtype: Optional[PointCloudData]
+        """
+        if not self.msg or self.msg.width == 0 or self.msg.height == 0:
+            return None
+
+        pc = PointCloudData(
+            data=np.frombuffer(self.msg.data, dtype=np.uint8),
+            point_step=self.msg.point_step,
+            row_step=self.msg.row_step,
+            height=self.msg.height,
+            width=self.msg.width,
+            is_bigendian=self.msg.is_bigendian,
+            frame_id=self.msg.header.frame_id,
+            timestamp=self.msg.header.stamp.sec + self.msg.header.stamp.nanosec * 1e-9,
+        )
+
+        for msg_field in self.msg.fields:
+            if msg_field.name == "x":
+                pc.x_offset = msg_field.offset
+                pc.x_field_datatype = msg_field.datatype
+            elif msg_field.name == "y":
+                pc.y_offset = msg_field.offset
+            elif msg_field.name == "z":
+                pc.z_offset = msg_field.offset
+
+        if pc.x_offset is None or pc.y_offset is None or pc.z_offset is None:
+            get_logger(self.node_name or "PointCloudCallback").warning(
+                "Offsets for x, y, z are not found, point cloud data is null"
+            )
+            return None
+
+        return pc
+
+    def _get_ui_content(self, **_) -> Dict:
+        """
+        Utility method to get UI compatible content.
+        To be used with external callbacks in UI Node
+        :returns:   Topic content
+        :rtype:     Any
+        """
+        # NOTE: Only sending metadata until browser front-end has a consumer
+        if not self.msg:
+            return {"frame_id": self.frame_id, "data": None}
+        return {
+            "frame_id": self.frame_id,
+            "data": {
+                "width": self.msg.width,
+                "height": self.msg.height,
+                "point_step": self.msg.point_step,
+            },
+        }
+
+
+class CameraInfoCallback(GenericCallback):
+    """ROS2 CameraInfo Callback Handler to process sensor_msgs/CameraInfo data"""
+
+    def __init__(self, input_topic, node_name: Optional[str] = None) -> None:
+        """
+        Constructs a new instance.
+
+        :param input_topic: Subscription topic
+        :param node_name: Name of the node using the callback
+        """
+        super().__init__(input_topic, node_name)
+        self._intrinsics: Optional[CameraIntrinsics] = None
+        self._intrinsics_key = None
+
+    def _get_output(self, **_) -> Optional[CameraIntrinsics]:
+        """
+        Gets the camera intrinsics of the last received message.
+
+        Intrinsics rarely change, so they are parsed once and reused until the
+        camera reports different ones.
+
+        :returns: Camera intrinsics
+        :rtype: Optional[CameraIntrinsics]
+        """
+        if not self.msg:
+            return None
+
+        # NOTE: width, height, K and P are the full-frame calibration values and do not
+        # change when the driver applies binning or a region of interest
+        roi = getattr(self.msg, "roi", None)
+        key = (
+            self.msg.header.frame_id,
+            self.msg.width,
+            self.msg.height,
+            tuple(self.msg.p),
+            tuple(self.msg.k),
+            getattr(self.msg, "binning_x", 0),
+            getattr(self.msg, "binning_y", 0),
+            (roi.x_offset, roi.y_offset, roi.width, roi.height) if roi else None,
+        )
+        if key != self._intrinsics_key:
+            self._intrinsics = read_camera_info(self.msg)
+            self._intrinsics_key = key
+        return self._intrinsics
 
     def _get_ui_content(self, **_) -> str:
-        """Get ui content for occupancy grid"""
-        # Convert occupancy grid values to grayscale image
-        output = self.get_output(get_obstacles=False, get_three_d=False)
-        img = np.zeros_like(output, dtype=np.uint8)
-        img[output == -1] = 127  # unknown
-        img[output == 0] = 255  # free
-        img[output > 0] = 0  # occupied
-
-        # Flip vertically (ROS map origin is bottom-left, OpenCV image top-left)
-        img = np.flipud(img)
-        return utils.convert_img_to_jpeg_str(img, self.node_name)
+        """Get UI content for CameraInfo: the pinhole parameters."""
+        intrinsics = self._get_output()
+        if not intrinsics:
+            return ""
+        return (
+            f"{intrinsics.width}x{intrinsics.height} in "
+            f"'{intrinsics.frame_id or 'unknown frame'}': "
+            f"f=({intrinsics.fx:.1f}, {intrinsics.fy:.1f}) "
+            f"c=({intrinsics.cx:.1f}, {intrinsics.cy:.1f})"
+        )
