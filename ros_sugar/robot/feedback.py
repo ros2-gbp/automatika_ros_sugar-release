@@ -15,8 +15,15 @@ from ..io.topic import Topic
 from .transports import Transport
 
 
-def _feedback_channel(key: str) -> str:
-    """Bus channel / synthetic topic name for a feedback stream."""
+def _feedback_channel(key: str, owner_id: str = "") -> str:
+    """Bus channel / synthetic topic name for a feedback stream.
+
+    Several plugins share one bus, so a channel is namespaced by the id of the
+    plugin that owns it. An unattached plugin has no id yet and keeps the bare
+    form, which is also what a recipe with a single plugin has always used.
+    """
+    if owner_id:
+        return f"plugin/{owner_id}/feedback/{key}"
     return f"robot/feedback/{key}"
 
 
@@ -50,12 +57,28 @@ class Feedback(BaseAttrs):
     decoder: Optional[Callable[[Any], Optional[Any]]] = field(default=None)
     rate_hz: Optional[float] = field(default=None)
     description: str = field(default="")
+    #: Frame this stream's data is expressed in. Stamped onto decoded messages
+    #: that carry a header but no frame, so components can place the data
+    #: without the decoder hard-coding a frame name. Falls back to the owning
+    #: plugin's frame when unset; a decoder that stamps its own is never
+    #: overridden.
+    frame_id: str = field(default="")
+    #: Whenever the plugin host publishes this feedback on ROS (see
+    #: ``ProcessSpec.inputs``), also broadcast its pose on TF as
+    #: ``header.frame_id -> child_frame_id``. For an odometry feedback, whose
+    #: message names both frames: it makes the plugin the owner of the
+    #: ``odom -> base`` transform that a localizer such as robot_localization
+    #: expects something else to provide.
+    publish_tf: bool = field(default=False)
+    #: Id of the owning plugin, stamped by ``Plugin._bind_identity`` when the
+    #: plugin is attached.
+    owner_id: str = field(default="", init=False, repr=False)
     _topic: Optional[Topic] = field(default=None, init=False, repr=False)
 
     @property
     def channel(self) -> str:
         """Feedback bus channel / synthetic topic name for this stream."""
-        return _feedback_channel(self.key)
+        return _feedback_channel(self.key, self.owner_id)
 
     def as_topic(self) -> Topic:
         """Return the `io.topic.Topic` that Events, Conditions
@@ -63,7 +86,8 @@ class Feedback(BaseAttrs):
 
         For a ROS-topic-backed feedback this is the ROS topic the robot
         publishes on; for any other transport it is a synthetic topic whose name
-        is the feedback bus channel.
+        is the feedback bus channel and whose ``use_plugin`` names the owning
+        plugin.
         """
         if self._topic is None:
             # RosTopicTransport carries the real topic name + type; reference
@@ -76,7 +100,11 @@ class Feedback(BaseAttrs):
                     qos_profile=getattr(transport, "qos", None) or {},
                 )
             else:
-                self._topic = Topic(name=self.channel, msg_type=self.msg_type)
+                self._topic = Topic(
+                    name=self.channel,
+                    msg_type=self.msg_type,
+                    use_plugin=self.owner_id or False,  # leave False for tests when plugin is not attached
+                )
         return self._topic
 
     @property

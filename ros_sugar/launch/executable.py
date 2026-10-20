@@ -6,6 +6,8 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.utilities import try_shutdown
 
+from ..utils import InvalidHandle
+
 
 def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
     """Parse arguments."""
@@ -59,9 +61,9 @@ def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
         help="Additional type modules from derived packages",
     )
     parser.add_argument(
-        "--robot_plugin",
+        "--plugins",
         type=str,
-        help="Serialized robot plugin spec and feedback-bus endpoint",
+        help="Serialized plugin specs and shared feedback-bus endpoint",
     )
     return parser.parse_known_args()
 
@@ -227,10 +229,10 @@ def setup_component(
     if args.external_processors:
         component._external_processors_json = args.external_processors
 
-    # Rebuild the robot plugin as a CLIENT and connect it to the HOST
-    # feedback bus running in the launcher process
-    if args.robot_plugin:
-        component._robot_plugin_json = args.robot_plugin
+    # Rebuild plugins as CLIENTs and connect them to the HOST feedback bus
+    # running in the launcher process
+    if args.plugins:
+        component._plugins_json = args.plugins
 
     return component
 
@@ -246,7 +248,19 @@ def run_component(component: object):
     executor.add_node(component)
 
     try:
-        executor.spin()
+        while True:
+            try:
+                executor.spin()
+                # Returned on its own: the context is down and so is the node
+                break
+            except InvalidHandle:
+                # NOTE: A component that deactivates, restarts or reconfigures
+                # destroys the timers and subscriptions its executor is
+                # waiting on. Some rclpy versions raise from the wait set
+                # instead of dropping the entity, and letting that end the
+                # spin would leave the process alive with nothing running in
+                # it. The next spin builds the wait set without what is gone
+                continue
 
     except KeyboardInterrupt:
         pass
