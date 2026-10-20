@@ -1,7 +1,9 @@
 """ROS Topics Supported Message Types"""
 
-from typing import Any, Union, Optional, List, Dict
+from typing import Any, Union, Optional, List, Dict, Tuple
 import base64
+import sys
+
 import numpy as np
 import importlib
 
@@ -9,6 +11,9 @@ import importlib
 from geometry_msgs.msg import Point as ROSPoint
 from geometry_msgs.msg import PointStamped as ROSPointStamped
 from geometry_msgs.msg import Pose as ROSPose
+from geometry_msgs.msg import PoseWithCovariance as ROSPoseWithCovariance
+from geometry_msgs.msg import PoseWithCovarianceStamped as ROSPoseWithCovarianceStamped
+from geometry_msgs.msg import PoseArray as ROSPoseArray
 from geometry_msgs.msg import PoseStamped as ROSPoseStamped
 from geometry_msgs.msg import Twist as ROSTwist
 
@@ -21,7 +26,14 @@ from automatika_ros_sugar.msg import ComponentStatus as ROSComponentStatus
 
 # SENSOR_MSGS SUPPORTED ROS TYPES
 from sensor_msgs.msg import Image as ROSImage, CompressedImage as ROSCompressedImage
+from sensor_msgs.msg import CameraInfo as ROSCameraInfo
+from sensor_msgs.msg import Imu as ROSImu
+from sensor_msgs.msg import JointState as ROSJointState
 from sensor_msgs.msg import LaserScan as ROSLaserScan
+from sensor_msgs.msg import NavSatFix as ROSNavSatFix
+from sensor_msgs.msg import PointCloud2 as ROSPointCloud2
+from sensor_msgs.msg import PointField as ROSPointField
+from sensor_msgs.msg import Range as ROSRange
 
 # STD_MSGS SUPPORTED ROS TYPES
 from std_msgs.msg import ByteMultiArray
@@ -37,7 +49,10 @@ from std_msgs.msg import (
 )
 
 from . import callbacks
-from .utils import numpy_to_multiarray
+from .datatypes import CameraIntrinsics
+from .utils import BYTES_KEY, ROS_MSG_KEY, get_ros_msg_class
+from .utils import _convert_ros_scalar, _split_ros_field_type
+from .utils import bytes_to_array, image_encoding, numpy_to_multiarray, stamp_header
 
 
 _additional_types = {}
@@ -141,11 +156,8 @@ def get_ros_msg_fields_dict(msg_class: type) -> Dict[str, Any]:
     msg_fields = msg_class.get_fields_and_field_types()
 
     for field_name, field_type_str in msg_fields.items():
-        # Check if it is an array (dynamic '[]' or static '[3]')
-        is_array = "[" in field_type_str
-
-        # Extract base type (remove array notation)
-        base_type = field_type_str.split("[")[0]
+        # Split into base type + sequence flag
+        base_type, is_array = _split_ros_field_type(field_type_str)
 
         # Check if it is a complex type (contains slash)
         if "/" in base_type:
@@ -194,8 +206,57 @@ def ros_msg_to_str(msg_object: Any) -> str:
                     lines += f"{item}, "
             lines += "]"
         else:
-            lines += f"{field_name.removeprefix('_')}: {field_value} | "
+            name = field_name[1:] if field_name.startswith("_") else field_name
+            lines += f"{name}: {field_value} | "
     return lines
+
+
+def validate_msg_fields(
+    msg_class: type, data_dict: Dict[str, Any], where: str = "the message"
+) -> None:
+    """Check that every key in a dict names a real field of a ROS message.
+
+    :param msg_class: The ROS message class the dict is meant to fill
+    :param data_dict: The values, nested the same way the message is
+    :param where: What to call the message in the error, for a caller who
+        cannot see which nested field is being checked
+    :raises ValueError: Naming the offending key, where it is (e.g. 'goals[1]'),
+        and the fields that do exist
+    """
+    _validate_fields(msg_class, data_dict, where, path="")
+
+
+def _validate_fields(
+    msg_class: type, data_dict: Dict[str, Any], where: str, path: str
+) -> None:
+    """validate_msg_fields, for the message at `path` inside the checked one"""
+    fields = msg_class.get_fields_and_field_types()
+    for field_name, field_value in data_dict.items():
+        if field_name not in fields:
+            owner = f"'{path}'" if path else where
+            raise ValueError(
+                f"{owner} has no field '{field_name}'. It has: "
+                f"{', '.join(sorted(fields))}"
+            )
+        base_type, _ = _split_ros_field_type(fields[field_name])
+        if "/" not in base_type or not isinstance(field_value, (dict, list)):
+            continue
+        module_str_name, msg_str_name = base_type.split("/")
+        try:
+            nested_class = getattr(
+                importlib.import_module(f"{module_str_name}.msg"), msg_str_name
+            )
+        except (ImportError, AttributeError):
+            # Not resolvable here; set_ros_msg_from_dict will report it
+            continue
+        field_path = f"{path}.{field_name}" if path else field_name
+        if isinstance(field_value, dict):
+            _validate_fields(nested_class, field_value, where, field_path)
+            continue
+        # A list of messages. Each item is checked
+        for index, item in enumerate(field_value):
+            if isinstance(item, dict):
+                _validate_fields(nested_class, item, where, f"{field_path}[{index}]")
 
 
 def set_ros_msg_from_dict(msg_class: type, data_dict: Dict[str, Any]) -> Any:
@@ -204,10 +265,14 @@ def set_ros_msg_from_dict(msg_class: type, data_dict: Dict[str, Any]) -> Any:
 
     :param msg_class: The ROS message class to instantiate (e.g., geometry_msgs.msg.Point)
     :param data_dict: Dictionary containing the values (keys must match message fields)
+    :raises ValueError: If a value cannot be converted to its declared field type.
     :return: An instance of msg_class populated with data
     """
-    # Instantiate the message
-    msg = msg_class()
+    # Ask setters to check each field's type and range
+    try:
+        msg = msg_class(check_fields=True)
+    except AssertionError:
+        msg = msg_class()  # for Humble which doesnt have the argument and always checks
 
     # Get the type definitions
     msg_fields_types = msg_class.get_fields_and_field_types()
@@ -218,44 +283,87 @@ def set_ros_msg_from_dict(msg_class: type, data_dict: Dict[str, Any]) -> Any:
             continue
 
         ros_type = msg_fields_types[field_name]
+        base_type, is_sequence = _split_ros_field_type(ros_type)
 
-        # Check if the field is an array/list (contains '[')
-        is_array = "[" in ros_type
-
-        # Handle Complex Types (nested messages, e.g., 'geometry_msgs/Point')
-        if "/" in ros_type:
-            # Extract base type name (remove array brackets if present)
-            base_type = ros_type.split("[")[0]
-            (module_str_name, msg_str_name) = base_type.split("/")
-
-            try:
+        try:
+            # Handle Complex Types (nested messages, e.g., 'geometry_msgs/Point')
+            if "/" in base_type:
+                (module_str_name, msg_str_name) = base_type.split("/")
                 msg_module = importlib.import_module(f"{module_str_name}.msg")
                 nested_msg_class = getattr(msg_module, msg_str_name)
 
-                if is_array:
-                    # If it's a list of complex objects, recurse for each item
+                if is_sequence:
                     # field_value is expected to be a list of dicts
-                    complex_array = []
-                    for item in field_value:
-                        complex_array.append(
+                    setattr(
+                        msg,
+                        field_name,
+                        [
                             set_ros_msg_from_dict(nested_msg_class, item)
-                        )
-                    setattr(msg, field_name, complex_array)
+                            for item in field_value
+                        ],
+                    )
                 else:
                     # Single complex object, recurse once
-                    # field_value is expected to be a dict
-                    nested_msg = set_ros_msg_from_dict(nested_msg_class, field_value)
-                    setattr(msg, field_name, nested_msg)
-
-            except (ModuleNotFoundError, ValueError, AttributeError) as e:
-                print(f"Error instantiating nested message for {field_name}: {e}")
-
-        # Handle Simple Types (int, float, string, etc.)
-        else:
-            attr_type = type(getattr(msg, field_name))
-            setattr(msg, field_name, attr_type(field_value))
+                    setattr(
+                        msg, field_name, set_ros_msg_from_dict(nested_msg_class, field_value)
+                    )
+            elif is_sequence:
+                # Require an actual list. So we don't coerce e.g a string into
+                # a list of characters which would crash native serialization
+                if isinstance(field_value, (str, bytes)) or not hasattr(
+                    field_value, "__iter__"
+                ):
+                    raise ValueError(
+                        f"expected a list of '{base_type}' values, "
+                        f"got {type(field_value).__name__}"
+                    )
+                setattr(
+                    msg,
+                    field_name,
+                    [_convert_ros_scalar(base_type, item) for item in field_value],
+                )
+            # Handle Simple Types (int, float, string, etc.)
+            else:
+                setattr(msg, field_name, _convert_ros_scalar(base_type, field_value))
+        except (
+            ValueError,
+            TypeError,
+            AttributeError,
+            ModuleNotFoundError,
+            AssertionError,
+        ) as e:
+            raise ValueError(
+                f"Invalid value for field '{field_name}' ({ros_type}): {e}"
+            ) from e
 
     return msg
+
+
+def from_jsonable(value: Any) -> Any:
+    """Rebuild what `utils.to_jsonable` was given.
+
+    Lives here rather than beside its other half because rebuilding a message is
+    `set_ros_msg_from_dict`; the encoding side needs nothing from this module.
+
+    Anything without one of the markers is returned as it arrived, so a plain
+    JSON payload, which is what most callers send, passes through untouched.
+
+    :param value: A decoded JSON value
+    :raises ValueError: If a marked message names a type that cannot be found,
+        or carries fields that do not fit it
+    :rtype: Any
+    """
+    if isinstance(value, dict):
+        if ROS_MSG_KEY in value:
+            return set_ros_msg_from_dict(
+                get_ros_msg_class(value[ROS_MSG_KEY]), value.get("fields") or {}
+            )
+        if BYTES_KEY in value:
+            return base64.b64decode(value[BYTES_KEY])
+        return {key: from_jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [from_jsonable(item) for item in value]
+    return value
 
 
 # SUPPORTED TYPES
@@ -291,6 +399,13 @@ class SupportedType:
     # callback class
     callback = callbacks.GenericCallback
 
+    # Whether the UI/API output stream for this type is rate-sampled by
+    # default instead of event-pushed per message. Set True on continuous
+    # high-bandwidth types (e.g. images, occupancy grids) where clients almost
+    # never want unthrottled raw frames. Derived packages should set this on
+    # their own heavy streaming types.
+    _ui_rate_sampled: bool = False
+
     @classmethod
     def convert(cls, *output, **_) -> Any:
         """ROS message converter function for datatype
@@ -310,8 +425,27 @@ class SupportedType:
         return cls._ros_type
 
     @classmethod
-    def convert_ui_dict(cls, data: Dict, **_) -> str:
-        return data.get("data", "")
+    def to_shm_payload(cls, msg: Any) -> Optional[Tuple[Dict, memoryview]]:
+        """Zero-copy hand-off for the shared-memory feedback fast path.
+
+        Return ``(meta, view)`` where ``view`` is a zero-copy ``memoryview`` of
+        the message's dominant buffer and ``meta`` carries everything
+        `from_shm_payload` needs to rebuild the message around a copy of it.
+        Return ``None`` (the default) for types that are not a good fit so the
+        caller falls back to CDR. Overridden on large, single-buffer types.
+        """
+        return None
+
+    @classmethod
+    def from_shm_payload(cls, meta: Dict, buffer: bytes) -> Any:
+        """Rebuild a ROS message from ``meta`` and a copy of the payload buffer.
+
+        Paired with `to_shm_payload`; only called for types that returned a
+        payload from it.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} does not implement from_shm_payload"
+        )
 
 
 class String(SupportedType):
@@ -346,11 +480,6 @@ class Bool(SupportedType):
         msg = ROSBool()
         msg.data = output
         return msg
-
-    @classmethod
-    def convert_ui_dict(cls, data: Dict, **_) -> str:
-        val = data.get("data", "")
-        return val == "on" or val == "1"
 
 
 class Float32(SupportedType):
@@ -422,19 +551,73 @@ class Image(SupportedType):
 
     _ros_type = ROSImage
     callback = callbacks.ImageCallback
+    _ui_rate_sampled = True  # continuous frames; also inherited by CompressedImage
 
     @classmethod
-    def convert(cls, output: Union[ROSImage, np.ndarray], **_) -> ROSImage:
-        """
-        Takes a ROS Image message or numpy array and returns a ROS Image message
+    def convert(
+        cls,
+        output: Union[ROSImage, np.ndarray],
+        encoding: Optional[str] = None,
+        stamp: Optional[float] = None,
+        frame_id: str = "",
+        **_,
+    ) -> ROSImage:
+        """Passes a ROS Image through, or builds a complete one around an array.
+
+        The array is (H, W) or (H, W, C). ``encoding`` names the pixel layout
+        as the array holds it. When unset, it is inferred from the dtype and the
+        channel count.
+
+        ``stamp`` in seconds and ``frame_id`` are for callers building
+        messages outside a publisher.
+
         :return: ROSImage
         """
         if isinstance(output, ROSImage):
             return output
+        if output.ndim not in (2, 3):
+            raise ValueError(f"An image array is (H, W) or (H, W, C), got {output.shape}")
+        channels = 1 if output.ndim == 2 else output.shape[2]
+        if encoding is None:
+            encoding = image_encoding(output.dtype, channels)
         msg = ROSImage()
+        stamp_header(msg.header, stamp, frame_id)
         msg.height = output.shape[0]
         msg.width = output.shape[1]
-        msg.data = output.flatten()
+        msg.encoding = encoding
+        msg.is_bigendian = 0 if sys.byteorder == "little" else 1
+        msg.step = output.shape[1] * channels * output.dtype.itemsize
+        msg.data = bytes_to_array(output.tobytes())
+        return msg
+
+    @classmethod
+    def to_shm_payload(cls, msg: ROSImage) -> Optional[Tuple[Dict, memoryview]]:
+        """Hand out the raw pixel buffer zero-copy, plus the header + geometry
+        fields needed to rebuild the message."""
+        meta = {
+            "h": msg.height,
+            "w": msg.width,
+            "e": msg.encoding,
+            "b": int(msg.is_bigendian),
+            "st": msg.step,
+            "s": msg.header.stamp.sec,
+            "ns": msg.header.stamp.nanosec,
+            "f": msg.header.frame_id,
+        }
+        return meta, memoryview(msg.data)
+
+    @classmethod
+    def from_shm_payload(cls, meta: Dict, buffer: bytes) -> ROSImage:
+        msg = ROSImage()
+        msg.header.stamp.sec = meta["s"]
+        msg.header.stamp.nanosec = meta["ns"]
+        msg.header.frame_id = meta["f"]
+        msg.height = meta["h"]
+        msg.width = meta["w"]
+        msg.encoding = meta["e"]
+        msg.is_bigendian = bool(meta["b"])
+        msg.step = meta["st"]
+        msg.data = bytes_to_array(buffer)
         return msg
 
 
@@ -457,7 +640,30 @@ class CompressedImage(Image):
             return output
         msg = ROSCompressedImage()
         msg.format = "png"
-        msg.data = output.flatten()
+        msg.data = bytes_to_array(np.asarray(output).tobytes())
+        return msg
+
+    @classmethod
+    def to_shm_payload(
+        cls, msg: ROSCompressedImage
+    ) -> Optional[Tuple[Dict, memoryview]]:
+        """CompressedImage carries only a format string plus the encoded blob."""
+        meta = {
+            "fmt": msg.format,
+            "s": msg.header.stamp.sec,
+            "ns": msg.header.stamp.nanosec,
+            "f": msg.header.frame_id,
+        }
+        return meta, memoryview(msg.data)
+
+    @classmethod
+    def from_shm_payload(cls, meta: Dict, buffer: bytes) -> ROSCompressedImage:
+        msg = ROSCompressedImage()
+        msg.header.stamp.sec = meta["s"]
+        msg.header.stamp.nanosec = meta["ns"]
+        msg.header.frame_id = meta["f"]
+        msg.format = meta["fmt"]
+        msg.data = bytes_to_array(buffer)
         return msg
 
 
@@ -479,7 +685,8 @@ class Audio(SupportedType):
             output = base64.b64decode(output)
 
         msg = ByteMultiArray()
-        msg.data = [bytes([b]) for b in output]
+        # One bytes object per byte, as byte[] needs
+        msg.data = memoryview(output).cast("c").tolist()
         return msg
 
 
@@ -501,7 +708,153 @@ class LaserScan(SupportedType):
     """LaserScan"""
 
     _ros_type = ROSLaserScan
-    callback = callbacks.GenericCallback
+    callback = callbacks.LaserScanCallback
+    _ui_rate_sampled = True  # dense sensor stream
+
+
+class PointCloud2(SupportedType):
+    """PointCloud2"""
+
+    _ros_type = ROSPointCloud2
+    callback = callbacks.PointCloudCallback
+    _ui_rate_sampled = True  # dense sensor stream
+
+    @classmethod
+    def to_shm_payload(cls, msg: ROSPointCloud2) -> Optional[Tuple[Dict, memoryview]]:
+        """The packed point buffer plus the field layout and geometry."""
+        meta = {
+            "h": msg.height,
+            "w": msg.width,
+            "b": int(msg.is_bigendian),
+            "ps": msg.point_step,
+            "rs": msg.row_step,
+            "d": int(msg.is_dense),
+            "fl": [(f.name, f.offset, f.datatype, f.count) for f in msg.fields],
+            "s": msg.header.stamp.sec,
+            "ns": msg.header.stamp.nanosec,
+            "f": msg.header.frame_id,
+        }
+        return meta, memoryview(msg.data)
+
+    @classmethod
+    def from_shm_payload(cls, meta: Dict, buffer: bytes) -> ROSPointCloud2:
+        msg = ROSPointCloud2()
+        msg.header.stamp.sec = meta["s"]
+        msg.header.stamp.nanosec = meta["ns"]
+        msg.header.frame_id = meta["f"]
+        msg.height = meta["h"]
+        msg.width = meta["w"]
+        msg.is_bigendian = bool(meta["b"])
+        msg.point_step = meta["ps"]
+        msg.row_step = meta["rs"]
+        msg.is_dense = bool(meta["d"])
+        msg.fields = [
+            ROSPointField(name=n, offset=o, datatype=dt, count=c)
+            for (n, o, dt, c) in meta["fl"]
+        ]
+        msg.data = bytes_to_array(buffer)
+        return msg
+
+
+class JointState(SupportedType):
+    """JointState"""
+
+    _ros_type = ROSJointState
+    callback = callbacks.JointStateCallback
+
+    # NOTE: Deliberately push-default (no _ui_rate_sampled): API consumers
+    # may need full-rate state data; dashboards can throttle with ?rate=<hz>
+
+    @classmethod
+    def convert(cls, output: Union[np.ndarray, List], **_) -> ROSJointState:
+        """ROS message converter for datatype JointState.
+
+        Takes an array of joint positions and produces a
+        ``sensor_msgs/JointState`` with its ``position`` field populated.
+
+        :param output: joint positions
+        :type output: Union[np.ndarray, List]
+        :rtype: ROSJointState
+        """
+        msg = ROSJointState()
+        msg.position = [float(v) for v in np.asarray(output, dtype=np.float64).ravel()]
+        return msg
+
+
+class CameraInfo(SupportedType):
+    """CameraInfo, the pinhole parameters that make an image metrically meaningful"""
+
+    _ros_type = ROSCameraInfo
+    callback = callbacks.CameraInfoCallback
+
+    # NOTE: Deliberately push-default (no _ui_rate_sampled); intrinsics are
+    # effectively static, so there is nothing to throttle
+
+    @classmethod
+    def convert(
+        cls,
+        output: Union[ROSCameraInfo, CameraIntrinsics],
+        stamp: Optional[float] = None,
+        frame_id: str = "",
+        **_,
+    ) -> ROSCameraInfo:
+        """Passes a ROS CameraInfo through, or builds one from CameraIntrinsics
+        as the inverse of `read_camera_info`.
+
+        Intrinsics carrying distortion coefficients describe a raw image. They
+        go into ``K`` and ``D`` and ``P`` stays unset, so a reader falls back
+        to ``K``. Intrinsics without coefficients describe a rectified or
+        registered image go into ``P``, and into ``K`` as well since no
+        raw matrix is known.
+
+        ``stamp`` in seconds and ``frame_id`` override the intrinsics' own,
+        for callers building messages outside a publisher.
+
+        :return: ROSCameraInfo
+        """
+        if isinstance(output, ROSCameraInfo):
+            return output
+        msg = ROSCameraInfo()
+        stamp_header(
+            msg.header,
+            output.timestamp if stamp is None else stamp,
+            frame_id or output.frame_id,
+        )
+        msg.width, msg.height = int(output.width), int(output.height)
+        msg.distortion_model = output.distortion_model
+        fx, fy, cx, cy = (float(v) for v in (output.fx, output.fy, output.cx, output.cy))
+        msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        distortion = np.asarray(output.distortion, dtype=np.float64).ravel()
+        if distortion.size:
+            msg.d = distortion.tolist()
+        else:
+            msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+        return msg
+
+
+class Imu(SupportedType):
+    """Imu"""
+
+    _ros_type = ROSImu
+    callback = callbacks.ImuCallback
+
+    # NOTE: Deliberately push-default (no _ui_rate_sampled): API consumers
+    # may need full-rate inertial data; dashboards can throttle with ?rate=<hz>
+
+
+class NavSatFix(SupportedType):
+    """NavSatFix"""
+
+    _ros_type = ROSNavSatFix
+    callback = callbacks.NavSatFixCallback
+
+
+class Range(SupportedType):
+    """Range"""
+
+    _ros_type = ROSRange
+    callback = callbacks.RangeCallback
 
 
 class Path(SupportedType):
@@ -525,6 +878,7 @@ class OccupancyGrid(SupportedType):
 
     _ros_type = ROSOccupancyGrid
     callback = callbacks.OccupancyGridCallback
+    _ui_rate_sampled = True  # large continuous grid
 
     @classmethod
     def convert(
@@ -555,11 +909,11 @@ class OccupancyGrid(SupportedType):
         msg.info.width = output.shape[0]
         msg.info.height = output.shape[1]
         msg.info.resolution = resolution
-        msg.info.origin = origin if origin else Pose()
+        msg.info.origin = origin if origin else ROSPose()
 
         # flatten by column
         # index (0,0) is the lower right corner of the grid in ROS
-        msg.data = output.flatten("F").astype(np.int8).tolist()
+        msg.data = bytes_to_array(output.flatten("F").astype(np.int8).tobytes(), "b")
         return msg
 
 
@@ -587,17 +941,6 @@ class Point(SupportedType):
         msg.y = output[1]
         msg.z = output[2]
         return msg
-
-    @classmethod
-    def convert_ui_dict(cls, data: Dict, **_) -> str:
-        return np.array(
-            [
-                float(data.get("x", 0.0)),
-                float(data.get("y", 0.0)),
-                float(data.get("z", 0.0)),
-            ],
-            dtype=np.float64,
-        )
 
 
 class PointStamped(Point):
@@ -658,22 +1001,55 @@ class Pose(SupportedType):
             msg.orientation.z = output[6]
         return msg
 
+
+class PoseWithCovariance(Pose):
+    """PoseWithCovariance"""
+
+    _ros_type = ROSPoseWithCovariance
+    callback = callbacks.PoseWithCovarianceCallback
+
     @classmethod
-    def convert_ui_dict(cls, data: Dict, **_) -> str:
-        return np.array(
-            [
-                float(data.get("x", 0.0)),
-                float(data.get("y", 0.0)),
-                float(data.get("z", 0.0)),
-                float(
-                    data.get("ori_w", 0.0) or "1.0"
-                ),  # 'or' is added to handle empty inputs (orientation is optional)
-                float(data.get("ori_x", 0.0) or "0.0"),
-                float(data.get("ori_y", 0.0) or "0.0"),
-                float(data.get("ori_z", 0.0) or "0.0"),
-            ],
-            dtype=np.float64,
-        )
+    def convert(cls, output: np.ndarray, covariance: list = None, **_) -> ROSPoseWithCovariance:
+        """ROS message converter function for datatype Point.
+
+        :param output:
+        :type output: np.ndarray
+        :param covariance:
+        :type covariance: list
+        :param _:
+        :rtype: ROSPoseWithCovariance
+        """
+        pose_msg = Pose.convert(output)
+        msg = ROSPoseWithCovariance()
+        msg.pose = pose_msg
+        if covariance is not None and len(covariance) == 36:
+            msg.covariance = covariance
+        return msg
+
+
+class PoseWithCovarianceStamped(PoseWithCovariance):
+    """PoseWithCovarianceStamped"""
+
+    _ros_type = ROSPoseWithCovarianceStamped
+    callback = callbacks.PoseWithCovarianceStampedCallback
+
+    @classmethod
+    def convert(
+        cls, output: np.ndarray, covariance: list = None, **_
+    ) -> ROSPoseWithCovarianceStamped:
+        """ROS message converter function for datatype Point.
+
+        :param output:
+        :type output: np.ndarray
+        :param covariance:
+        :type covariance: list
+        :param _:
+        :rtype: ROSPoseWithCovarianceStamped
+        """
+        pose_w_cov_msg = PoseWithCovariance.convert(output, covariance)
+        msg = ROSPoseWithCovarianceStamped()
+        msg.pose = pose_w_cov_msg
+        return msg
 
 
 class PoseStamped(Pose):
@@ -705,6 +1081,43 @@ class PoseStamped(Pose):
             msg.pose.orientation.x = output[4]
             msg.pose.orientation.y = output[5]
             msg.pose.orientation.z = output[6]
+        return msg
+
+
+class PoseArray(SupportedType):
+    """PoseArray"""
+
+    _ros_type = ROSPoseArray
+    callback = callbacks.PoseArrayCallback
+
+    @classmethod
+    def convert(cls, output: Union[np.ndarray, List], **_) -> ROSPoseArray:
+        """ROS message converter function for datatype PoseArray.
+
+        Each element of the given set is a single pose as [x, y, z],
+        [x, y, z, heading] or [x, y, z, qw, qx, qy, qz]
+
+        :param output: Set of poses
+        :type output: Union[np.ndarray, List]
+        :param _:
+        :rtype: ROSPoseArray
+        """
+        msg = ROSPoseArray()
+        poses = []
+        for pose_data in output:
+            pose_data = np.asarray(pose_data, dtype=np.float64)
+            if pose_data.shape[0] == 4:
+                pose = ROSPose()
+                pose.position.x = pose_data[0]
+                pose.position.y = pose_data[1]
+                pose.position.z = pose_data[2]
+                # heading to quaternion around z
+                pose.orientation.z = np.sin(pose_data[3] / 2)
+                pose.orientation.w = np.cos(pose_data[3] / 2)
+            else:
+                pose = Pose.convert(pose_data)
+            poses.append(pose)
+        msg.poses = poses
         return msg
 
 
