@@ -86,6 +86,22 @@ def main_action_callback(self, goal_handle):
     return result
 ```
 
+**One goal at a time.** A new goal is rejected while another is ongoing, rather than replacing it: a component executing a motion should finish or be stopped, not have a second motion started on top of it. A goal counts as ongoing until its callback returns, not merely until it reaches a terminal state, so the cleanup of one goal never overlaps the start of the next.
+
+To stop the ongoing goal without holding its handle, the component offers `cancel_main_goal` as an ordinary component action. It is therefore reachable everywhere a component action is: from an event, as a routine step, over the runtime API, from the UI, and as an LLM tool.
+
+```python
+launcher.on(obstacle_detected, Action(my_component.cancel_main_goal))
+```
+
+The same operation is also served as a plain `std_srvs/Trigger` service, for a terminal or a node that knows nothing about this framework:
+
+```bash
+ros2 service call /my_component/cancel_main_action std_srvs/srv/Trigger
+```
+
+Finding nothing to cancel is a **success**: what the caller asked for is that no goal is running, and none is, so a routine step that stops a component does not fail because it had already stopped. A goal that has been cancelled but whose callback has not returned reports success with "the ongoing goal is already stopping": that is the window in which new goals are still refused. Only a component whose run type is `ACTION_SERVER` advertises the action.
+
 ### `main_service_callback()` — SERVER mode
 
 Called when a service request is received. Required when `run_type == ComponentRunType.SERVER`:
@@ -102,7 +118,7 @@ Override these to run custom logic during lifecycle transitions. All are optiona
 
 | Hook | Called when | Common use |
 |:-----|:-----------|:-----------|
-| `init_variables()` | Start of activation | Initialize state variables |
+| `init_variables()` | Start of activation, after plugin adaptation and before subscribers exist | Initialize state variables; declare input frames with `transform_input_to()` |
 | `custom_on_configure()` | After configuration | Set up internal resources |
 | `custom_on_activate()` | After activation | Start background tasks, create TF listeners |
 | `custom_on_deactivate()` | After deactivation | Pause background tasks |
@@ -122,9 +138,7 @@ class MyComponent(BaseComponent):
         self.get_logger().info("Configured")
 
     def custom_on_activate(self):
-        self.tf_listener = self.create_tf_listener(
-            TFListenerConfig(lookup_rate=10.0)
-        )
+        self.get_logger().info("Active")
 ```
 
 ## Accessing Inputs and Outputs
@@ -162,6 +176,25 @@ self.publishers_dict["output"].publish(result)
 self.publishers_dict["pose"].publish(pose_data, frame_id="map")
 ```
 
+## Working with Frames
+
+Every spatial input (scans, clouds, grids, odometry, paths, poses, points) can be delivered already expressed in the frame the component's algorithm needs. Declare the target frame in `init_variables()`, before the subscribers are created:
+
+```python
+def init_variables(self):
+    # Scans arrive in whatever frame the sensor stamps them with; the
+    # controller wants them in the robot body frame
+    self.transform_input_to("scan", self.config.frames.robot_base)
+    # A fixed map only needs one lookup
+    self.transform_input_to("map", self.config.frames.world, static_tf=True)
+```
+
+The source frame is read from each message's `header.frame_id`, so no sensor frame is configured anywhere. From then on `self.callbacks["scan"].get_output()` returns the data in the body frame; while the transform is still unavailable the data is used untransformed. All frame pairs share one TF buffer per component, so the node subscribes to `/tf` and `/tf_static` once no matter how many sensors it tracks.
+
+For lookups outside an input, `self.get_transform(source_frame, goal_frame, static_tf=False)` returns the `TransformStamped` between two frames, or `None` until it has been resolved. Repeated calls for the same pair are cheap; each pair gets a cached listener polling at `TFListenerConfig.lookup_rate`.
+
+Frame names come from `config.frames`, a `RobotFrames` with `robot_base` (default `"base_link"`) and `world` (default `"map"`). The Launcher sets them for every component from `launcher.frames`, `launcher.robot_frame` / `launcher.world_frame`, or the attached robot plugin's `base_frame`, so a component should read them rather than hard-code frame names.
+
 ## Run Types
 
 Set the run type via configuration to control how `_execution_step()` is triggered:
@@ -187,6 +220,21 @@ component = MyComponent(
 ```
 
 ## Configuration
+
+`BaseComponentConfig` carries the parameters every component has:
+
+| Field | Default | Meaning |
+|:------|:--------|:--------|
+| `loop_rate` | `100.0` | Execution timer rate in Hz (`TIMED` run type) and health-status publishing rate |
+| `fallback_rate` | `100.0` | Rate at which the component checks its health status and runs fallbacks |
+| `log_level` | `"info"` | Component logger level |
+| `rclpy_log_level` | `"warn"` | rclpy / RMW logger level |
+| `robot` | `None` | `RobotConfig`: model type, geometry and control limits, set by the Launcher from `launcher.robot` or the robot plugin |
+| `frames` | `RobotFrames()` | Body and world frame names, set by the Launcher |
+| `wait_for_restart_time` | `6000.0` | Seconds to wait for the node to come back after a `restart()` |
+| `executor_spin_timeout` | `0.01` | Spin timeout of the in-process executor (multithreaded launch) |
+| `_run_type` | `TIMED` | See [Run Types](#run-types) |
+| `_lifecycle_state_transition_timeout` | `10.0` | Seconds to wait on a lifecycle transition |
 
 ### Extending BaseComponentConfig
 
@@ -217,16 +265,25 @@ component = MyComponent(config_file="/path/to/config.yaml")
 
 # At runtime
 component.config_from_file("/path/to/config.yaml")
+
+# On a config object directly (YAML, JSON or TOML by extension)
+config = MyConfig()
+config.from_file("/path/to/config.yaml", nested_root_name="my_component", get_common=True)
 ```
 
 YAML structure:
 
 ```yaml
+/**:                     # Common parameters, merged into every component (get_common)
+  fallback_rate: 10.0
+
 my_component:            # Must match component_name
   loop_rate: 50.0
   threshold: 0.8
   window_size: 20
 ```
+
+`from_file` returns `False` when the file has no section for the component. Configs also round-trip through `to_json()` / `from_json()`, which is how a component's configuration reaches its process under multiprocess launch. Algorithm configurations registered on a component travel as explicitly set fields only (`explicit_fields`), so values the component computes for itself are not overwritten by defaults.
 
 ## Restricting Allowed Topics
 
@@ -257,21 +314,24 @@ The validation runs during initialization and raises if required topics are miss
 Use the `@component_action` decorator to mark methods as dispatchable actions. These can be used as fallback targets or wired to events:
 
 ```python
-from ros_sugar.utils import component_action, component_fallback
+from ros_sugar.utils import ActionReturnType, component_action, component_fallback
 
 class MyComponent(BaseComponent):
     @component_action
-    def reset_buffer(self) -> bool:
+    def reset_buffer(self) -> ActionReturnType:
         self.buffer = []
-        return True
+        return True, "buffer reset"
 
     @component_fallback
-    def emergency_stop(self):
+    def emergency_stop(self) -> ActionReturnType:
         self.publishers_dict["velocity"].publish(0.0)
+        return True, "motors stopped"
 ```
 
-- `@component_action`: Validates lifecycle state before execution. Return type should be `bool` or `None`.
+- `@component_action`: Validates lifecycle state before execution. **Must be annotated to return `Tuple[bool, str]`** (aliased as `ActionReturnType`) — the bool reports success, the string carries a result or an error message. When an action is invoked remotely through the `ExecuteMethod` service, the bool becomes the response's `success`; see the [built-in services](../advanced/srvs.md).
 - `@component_fallback`: Validates the component is in a valid state (active, inactive, or activating).
+
+A fallback action is a **plain** action. Declaring one as a monitored `Action` — with `success`, `timeout`, `max_retries` or `cancel_method` — is refused where it is set, because a fallback runs from the fallback loop when the component has already failed, with nothing there to watch a success condition or to run retries. A recovery that needs those belongs in a `Routine`, whose steps can be monitored and can have fallbacks of their own.
 
 ### Tool Descriptions for LLM Orchestration
 
@@ -286,9 +346,9 @@ class MyComponent(BaseComponent):
             "description": "Clears the internal data buffer and resets processing state.",
         },
     })
-    def reset_buffer(self) -> bool:
+    def reset_buffer(self) -> ActionReturnType:
         self.buffer = []
-        return True
+        return True, "buffer reset"
 
     @component_fallback(description={
         "type": "function",
@@ -297,15 +357,16 @@ class MyComponent(BaseComponent):
             "description": "Immediately stops all motor output.",
         },
     })
-    def emergency_stop(self):
+    def emergency_stop(self) -> ActionReturnType:
         self.publishers_dict["velocity"].publish(0.0)
+        return True, "motors stopped"
 ```
 
 When `description` is omitted, the method's docstring is used as the description. The `active` parameter is also supported on `@component_action` to require the Active lifecycle state:
 
 ```python
 @component_action(description={...}, active=True)
-def move_forward(self) -> bool:
+def move_forward(self) -> ActionReturnType:
     ...
 ```
 
@@ -322,7 +383,8 @@ Every component inherits these actions that can be used directly in fallbacks or
 | `set_param(name, value, keep_alive=True)` | Change one parameter |
 | `set_params(names, values, keep_alive=True)` | Change multiple parameters |
 | `broadcast_status()` | Publish current health status |
-| `inspect_component()` | Return a string summary of the component's config, inputs, and outputs |
+
+All of them follow the action contract and return `ActionReturnType`. `inspect_component()`, which returns a string summary of the component's config, inputs and outputs, is **not** an action: it is an undecorated method returning `str`, so it cannot be used in an event or a fallback.
 
 ### Custom Action/Service Names
 
@@ -349,6 +411,20 @@ Subclasses can override these methods to support dynamic I/O reconfiguration at 
 
 These are called by the `Launcher.inputs()` and `Launcher.outputs()` methods to propagate settings across all components.
 
+## Placing the Process
+
+Under multiprocess launch every component has a process of its own, and `launch_prefix` prepends a command to it: CPU pinning, a scheduling class, or a profiler.
+
+```python
+vision = VisionComponent(component_name="vision")
+vision.launch_prefix = "taskset -c 4-7"        # keep it on the performance cores
+logger_comp.launch_prefix = "nice -n 10"
+
+launcher.add_pkg(components=[vision, logger_comp], package_name="my_pkg", multiprocessing=True)
+```
+
+The prefix has no effect on a component running in a launcher thread; the Launcher warns if one is set there.
+
 ## Complete Skeleton
 
 ```python
@@ -358,7 +434,7 @@ from ros_sugar.core import BaseComponent, Action
 from ros_sugar.io import Topic
 from ros_sugar.io.supported_types import Float64, String
 from ros_sugar.config import BaseComponentConfig, base_validators
-from ros_sugar.utils import component_action
+from ros_sugar.utils import ActionReturnType, component_action
 from ros_sugar.launch import Launcher
 
 
@@ -408,9 +484,9 @@ class ExponentialFilter(BaseComponent):
         self.publishers_dict["filtered_signal"].publish(self._filtered)
 
     @component_action
-    def reset_filter(self) -> bool:
+    def reset_filter(self) -> ActionReturnType:
         self._filtered = 0.0
-        return True
+        return True, "filter reset"
 
 
 # --- Usage ---
