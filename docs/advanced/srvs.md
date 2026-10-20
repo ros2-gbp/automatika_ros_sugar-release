@@ -74,3 +74,28 @@ The `ExecuteMethod` service enables runtime invocation of any class method in th
 
 - **Service Name: /{component_name}/execute_method**
 - **Service Type: [automatika_ros_sugar/srv/ExecuteMethod](https://github.com/automatika-robotics/sugarcoat/blob/main/srv/ExecuteMethod.srv)**
+
+The request carries the method `name` and its keyword arguments as a JSON object in `kwargs_json`. Methods decorated with `@component_action` are the intended targets; the UI, the JSON API and LLM-driven orchestration in EmbodiedAgents all call actions through this service.
+
+### Response semantics
+
+A component action returns `(success, message)` — see
+[the action contract](../development/event_system.md#the-action-contract). The response fields map
+onto that pair directly:
+
+| Field | Meaning |
+|:------|:--------|
+| `success` | The bool half of the action's result |
+| `response_json` | The message, JSON-encoded, when the action **succeeded** |
+| `error_msg` | The message when the action **failed**, or when the method does not exist or raised |
+
+An action returning something structured serializes it into the message itself, so `response_json`
+then holds a JSON string containing that JSON.
+
+### Example
+
+Call an action `reset_buffer(size: int)` on `awesome_component`:
+
+```shell
+ros2 service call /awesome_component/execute_method automatika_ros_sugar/srv/ExecuteMethod "{name: 'reset_buffer', kwargs_json: '{\"size\": 10}'}"
+```
