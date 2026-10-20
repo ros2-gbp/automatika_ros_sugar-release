@@ -1,0 +1,655 @@
+"""Data containers for ROS message payloads processed by callbacks."""
+
+import math
+from typing import Any, Dict, List, Optional, Sequence, Union
+
+import numpy as np
+from attrs import Factory, define, field
+from sensor_msgs.msg import PointField
+
+from ..config import BaseAttrs, base_validators
+
+
+# Numpy format characters for sensor_msgs/PointField datatype constants
+_POINTFIELD_NP_FORMATS = {
+    PointField.INT8: "i1",
+    PointField.UINT8: "u1",
+    PointField.INT16: "i2",
+    PointField.UINT16: "u2",
+    PointField.INT32: "i4",
+    PointField.UINT32: "u4",
+    PointField.FLOAT32: "f4",
+    PointField.FLOAT64: "f8",
+}
+
+
+def _rotation_matrix_from_quaternion(quaternion: Sequence[float]) -> np.ndarray:
+    """Rotation matrix for a ROS quaternion.
+
+    :param quaternion: Quaternion as [x, y, z, w]
+    :type quaternion: Sequence[float]
+    :return: 3x3 rotation matrix
+    :rtype: np.ndarray
+    """
+    x, y, z, w = (float(value) for value in quaternion)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm == 0.0:
+        return np.eye(3, dtype=np.float32)
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _quaternion_multiply(
+    quaternion_1: Sequence[float], quaternion_2: Sequence[float]
+) -> np.ndarray:
+    """Compose two ROS quaternions, applying the first after the second.
+
+    :param quaternion_1: Left hand quaternion as [x, y, z, w]
+    :type quaternion_1: Sequence[float]
+    :param quaternion_2: Right hand quaternion as [x, y, z, w]
+    :type quaternion_2: Sequence[float]
+    :return: Composed quaternion as [x, y, z, w]
+    :rtype: np.ndarray
+    """
+    x1, y1, z1, w1 = (float(value) for value in quaternion_1)
+    x2, y2, z2, w2 = (float(value) for value in quaternion_2)
+    return np.array(
+        [
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ],
+        dtype=np.float32,
+    )
+
+
+@define
+class PointCloudData(BaseAttrs):
+    """Container for sensor_msgs/PointCloud2 data.
+
+    Carries the raw (undecoded) point buffer along with the layout metadata
+    needed to interpret it. Consumers that operate on the raw buffer pay no
+    decoding cost. Consumers that want cartesian points can use the lazily
+    decoded `xyz` property.
+
+    :param data: Raw point buffer as a flat uint8 array
+    :param point_step: Length of a single point in bytes
+    :param row_step: Length of a single row in bytes
+    :param height: Number of rows (1 for unorganized clouds)
+    :param width: Number of points per row
+    :param x_offset: Byte offset of the 'x' field within a point
+    :param y_offset: Byte offset of the 'y' field within a point
+    :param z_offset: Byte offset of the 'z' field within a point
+    :param x_field_datatype: Datatype of the coordinate fields as a
+        sensor_msgs/PointField datatype constant (FLOAT32 assumed if not set)
+    :param is_bigendian: Endianness of the point buffer
+    :param frame_id: Coordinates frame of the cloud
+    :param timestamp: Message timestamp in seconds
+    """
+
+    data: np.ndarray = field(eq=False)
+    point_step: int = field(validator=base_validators.gt(0))
+    row_step: int = field(validator=base_validators.gt(0))
+    height: int = field(validator=base_validators.gt(0))
+    width: int = field(validator=base_validators.gt(0))
+    x_offset: Optional[int] = field(default=None)
+    y_offset: Optional[int] = field(default=None)
+    z_offset: Optional[int] = field(default=None)
+    x_field_datatype: Optional[int] = field(default=None)
+    is_bigendian: bool = field(default=False)
+    frame_id: str = field(default="")
+    timestamp: float = field(default=0.0)
+    _xyz_cache: Optional[np.ndarray] = field(
+        default=None, init=False, repr=False, eq=False
+    )
+
+    def _point_dtype(self) -> np.dtype:
+        """Structured dtype addressing the x/y/z fields inside a point record."""
+        np_format = _POINTFIELD_NP_FORMATS.get(self.x_field_datatype, "f4")
+        endianness = ">" if self.is_bigendian else "<"
+        return np.dtype({
+            "names": ["x", "y", "z"],
+            "formats": [endianness + np_format] * 3,
+            "offsets": [self.x_offset, self.y_offset, self.z_offset],
+            "itemsize": self.point_step,
+        })
+
+    def _unpadded(self) -> np.ndarray:
+        """The raw buffer with row padding removed, so records sit contiguously."""
+        raw = self.data
+        row_bytes = self.width * self.point_step
+        if self.row_step != row_bytes and self.height > 1:
+            raw = np.ascontiguousarray(
+                raw[: self.height * self.row_step].reshape(self.height, self.row_step)[
+                    :, :row_bytes
+                ]
+            ).reshape(-1)
+        return raw
+
+    def _decode_all(self) -> Optional[np.ndarray]:
+        """Every point in the buffer, in order, non-finite ones included.
+
+        Row ``i`` is point record ``i``, which is what lets a mask computed
+        from these coordinates be applied back to the raw buffer.
+
+        :return: Nx3 float32 array, or None if the cloud has no x/y/z fields
+        :rtype: Optional[np.ndarray]
+        """
+        if self.x_offset is None or self.y_offset is None or self.z_offset is None:
+            return None
+        points = np.frombuffer(
+            self._unpadded(), dtype=self._point_dtype(), count=self.height * self.width
+        )
+        return np.column_stack((points["x"], points["y"], points["z"])).astype(
+            np.float32, copy=False
+        )
+
+    @property
+    def xyz(self) -> Optional[np.ndarray]:
+        """Cartesian points decoded from the raw buffer, lazily and cached.
+
+        Non-finite points (NaN/inf padding in organized clouds) are dropped.
+
+        :return: Nx3 float32 array of finite points, or None if the cloud
+            has no x/y/z fields
+        :rtype: Optional[np.ndarray]
+        """
+        if self._xyz_cache is not None:
+            return self._xyz_cache
+        xyz = self._decode_all()
+        if xyz is None:
+            return None
+        self._xyz_cache = xyz[np.isfinite(xyz).all(axis=1)]
+        return self._xyz_cache
+
+    def buffer_layout(self) -> Dict[str, Any]:
+        """The raw point buffer with the fields that describe it, as keyword
+        arguments for a raw-buffer consumer.
+
+        Unlike ``asdict()``, which returns every field of the container, nothing
+        else is included. The buffer is passed through, not copied, and nothing is decoded.
+
+        :return: Buffer and layout keyword arguments
+        :rtype: Dict[str, Any]
+        """
+        return {
+            "data": self.data,
+            "point_step": self.point_step,
+            "row_step": self.row_step,
+            "height": self.height,
+            "width": self.width,
+            "x_offset": self.x_offset,
+            "y_offset": self.y_offset,
+            "z_offset": self.z_offset,
+        }
+
+    def filtered(
+        self,
+        translation: Optional[Sequence[float]] = None,
+        rotation: Optional[Sequence[float]] = None,
+        frame_id: Optional[str] = None,
+        min_z: Optional[float] = None,
+        max_z: Optional[float] = None,
+        discard_underground: bool = False,
+        get_2d: bool = False,
+    ) -> Optional["PointCloudData"]:
+        """A new cloud with the transform and the height filters applied.
+
+        Rebuilds raw buffer rather than only the decoded `xyz`, for downstream
+        consumers of it.
+
+        Whole point records are kept or dropped and only x/y/z are rewritten,
+        so every other field (intensity, rgb, ...) survives intact.
+
+        :param translation: Sensor-to-target translation [x, y, z]
+        :param rotation: Sensor-to-target rotation quaternion [x, y, z, w]
+        :param frame_id: Frame the points end up in once transformed
+        :param min_z: Drop points below this height, in the target frame
+        :param max_z: Drop points above this height, in the target frame
+        :param discard_underground: Drop points below the ground plane. The
+            transform's z translation is the sensor's height above the target
+            frame, so the ground sits at z = 0 once transformed. Without a
+            transform the ground cannot be located and this is ignored.
+        :param get_2d: Flatten the surviving points onto z = 0
+        :return: A new container, or None if no point survives
+        :rtype: Optional[PointCloudData]
+        """
+        xyz = self._decode_all()
+        if xyz is None:
+            return None
+
+        # Organized clouds pad with NaN/inf; those are never real returns
+        keep = np.isfinite(xyz).all(axis=1)
+
+        if rotation is not None:
+            xyz = xyz @ _rotation_matrix_from_quaternion(rotation).T
+        if translation is not None:
+            xyz = xyz + np.asarray(translation, dtype=np.float32)
+
+        if min_z is not None:
+            keep &= xyz[:, 2] >= min_z
+        if max_z is not None:
+            keep &= xyz[:, 2] <= max_z
+        if discard_underground and translation is not None:
+            keep &= xyz[:, 2] >= 0.0
+
+        # After the height filters, so the band is judged on the real heights
+        if get_2d:
+            xyz[:, 2] = 0.0
+
+        n_kept = int(np.count_nonzero(keep))
+        if not n_kept:
+            return None
+
+        records = self._unpadded()[: self.height * self.width * self.point_step]
+        kept = np.ascontiguousarray(records.reshape(-1, self.point_step)[keep]).reshape(
+            -1
+        )
+
+        # Write the transformed coordinates back into the surviving records
+        struct = kept.view(self._point_dtype())
+        struct["x"] = xyz[keep, 0]
+        struct["y"] = xyz[keep, 1]
+        struct["z"] = xyz[keep, 2]
+
+        out = PointCloudData(
+            data=kept,
+            point_step=self.point_step,
+            row_step=n_kept * self.point_step,
+            height=1,  # filtering cannot preserve the row layout
+            width=n_kept,
+            x_offset=self.x_offset,
+            y_offset=self.y_offset,
+            z_offset=self.z_offset,
+            x_field_datatype=self.x_field_datatype,
+            is_bigendian=self.is_bigendian,
+            frame_id=frame_id or self.frame_id,
+            timestamp=self.timestamp,
+        )
+        out._xyz_cache = xyz[keep]
+        return out
+
+
+def _convert_to_0_2pi(value: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+    """
+    Convert an angle or array of angles to [0, 2pi]
+
+    :param value: Input Angle(s) (rad)
+    :type value: float | np.ndarray
+    :return: Converted Angle(s) (rad)
+    :rtype: float | np.ndarray
+    """
+    value = value % (2 * math.pi)
+    if isinstance(value, np.ndarray):
+        return np.where(value < 0, value + 2 * np.pi, value)
+    return value + 2 * math.pi if value < 0 else value
+
+
+@define
+class LaserScanData(BaseAttrs):
+    """
+    Single scan from a planar laser range-finder (LiDAR)
+
+    attributes:
+    angle_min           float32         start angle of the scan [rad]
+    angle_max           float32         end angle of the scan [rad]
+    angle_increment     float32         angular distance between measurements [rad]
+
+    time_increment      float32         time between measurements [seconds] - if your scanner
+                                        is moving, this will be used in interpolating position of 3d points
+
+    scan_time           float32         time between scans [seconds]
+    range_min           float32         minimum range value [m]
+    range_max           float32         maximum range value [m]
+
+    ranges              List[float32]   range data [m] (Note: values < range_min or > range_max should be discarded)
+    angles              float32[]       angle of each range measurement [rad] (generated from the
+                                        angle limits and increment if not provided)
+    intensities         float32[]       intensity data [device-specific units].
+                                        If your device does not provide intensities, please leave the array empty.
+    frame_id            string          coordinates frame of the scan
+    timestamp           float           message timestamp in seconds
+    """
+
+    angle_min: float = field(
+        default=0.0,
+        validator=base_validators.in_range(
+            min_value=-2 * math.pi, max_value=2 * math.pi
+        ),
+    )
+    angle_max: float = field(
+        default=2 * math.pi,
+        validator=base_validators.in_range(
+            min_value=-2 * math.pi, max_value=2 * math.pi
+        ),
+    )
+    angle_increment: float = field(
+        default=0.01 * math.pi,
+        validator=base_validators.in_range(min_value=-math.pi, max_value=math.pi),
+    )
+    time_increment: float = field(
+        default=1e-3, validator=base_validators.in_range(min_value=0.0, max_value=1e3)
+    )
+    scan_time: float = field(
+        default=1e-3, validator=base_validators.in_range(min_value=0.0, max_value=1e3)
+    )
+    range_min: float = field(
+        default=0.0, validator=base_validators.in_range(min_value=0.0, max_value=1e3)
+    )
+    range_max: float = field(
+        default=20.0, validator=base_validators.in_range(min_value=1e-3, max_value=1e3)
+    )
+    ranges: np.ndarray = field(default=Factory(lambda: np.empty(0)), eq=False)
+    angles: np.ndarray = field(default=Factory(lambda: np.empty(0)), eq=False)
+    intensities: np.ndarray = field(default=Factory(lambda: np.empty(0)), eq=False)
+    frame_id: str = field(default="")
+    timestamp: float = field(default=0.0)
+
+    def __attrs_post_init__(self):
+        if self.angles.size == 0:
+            # float32 is a downstream zero-copy fast path
+            self.angles = np.arange(
+                self.angle_min,
+                self.angle_max + self.angle_increment,
+                self.angle_increment,
+                dtype=np.float32,
+            )
+
+        if self.ranges.size == 0:
+            # default to max range; float32 is a downstream zero-copy fast path
+            self.ranges = np.full(self.angles.size, self.range_max, dtype=np.float32)
+
+        if self.angles.size != self.ranges.size:
+            minimum_size = min(self.angles.size, self.ranges.size)
+            self.angles = self.angles[:minimum_size]
+            self.ranges = self.ranges[:minimum_size]
+
+    def get_ranges(
+        self,
+        right_angle: float,
+        left_angle: float,
+    ) -> np.ndarray:
+        """Get ranges values in a defined zone between a left angle and a right angle
+
+        :param right_angle: Value of the angle on the right of the ranges (rad)
+        :type right_angle: float
+        :param left_angle: Value of the angle on the left of the ranges (rad)
+        :type left_angle: float
+
+        :return: Ranges values in the specified zone
+        :rtype: np.ndarray
+        """
+        return self.ranges[self.__angles_in_zone(right_angle, left_angle)]
+
+    def get_angles(
+        self,
+        right_angle: float,
+        left_angle: float,
+    ) -> np.ndarray:
+        """Get angles values in a defined zone between a left angle and a right angle
+
+        :param right_angle: Value of the angle on the right of the ranges (rad)
+        :type right_angle: float
+        :param left_angle: Value of the angle on the left of the ranges (rad)
+        :type left_angle: float
+
+        :return: Angles values in the specified zone
+        :rtype: np.ndarray
+        """
+        return self.angles[self.__angles_in_zone(right_angle, left_angle)]
+
+    def __angles_in_zone(self, right_angle: float, left_angle: float) -> np.ndarray:
+        """Get a mask of the scan angles lying between a right and a left angle
+
+        :return: Boolean mask over the scan angles
+        :rtype: np.ndarray
+        """
+        angles = _convert_to_0_2pi(self.angles)
+        left_angle = _convert_to_0_2pi(left_angle)
+        right_angle = _convert_to_0_2pi(right_angle)
+
+        if right_angle > left_angle:
+            return (angles <= left_angle) | (angles >= right_angle)
+        return (angles <= left_angle) & (angles >= right_angle)
+
+
+def _get_laserscan_transformed_polar_coordinates(
+    angle_min: float,
+    angle_max: float,
+    angle_increment: float,
+    laser_scan_ranges: np.ndarray,
+    max_scan_range: float,
+    translation: List[float],
+    rotation: List[float],
+    intensities: Optional[np.ndarray] = None,
+) -> LaserScanData:
+    """
+    Transform list of angles and ranges to laserscan data using a given polar transformation
+
+    :param angle_min: Scan min angle (rad)
+    :type angle_min: float
+    :param angle_max: Scan max angle (rad)
+    :type angle_max: float
+    :param angle_increment: Scan angle step (rad)
+    :type angle_increment: float
+    :param laser_scan_ranges: Values of the laser scan along the angles range (m)
+    :type laser_scan_ranges: np.ndarray
+    :param max_scan_range: Max range for the scan (m)
+    :type max_scan_range: float
+    :param translation: Translation vector [x, y, z]
+    :type translation: list[float]
+    :param rotation: Rotation quaternion [x, y, z, w]
+    :type rotation: list[float]
+    :param intensities: Scan intensities along the angles range
+    :type intensities: Optional[np.ndarray]
+
+    :return: Transformed laser scan data
+    :rtype: LaserScanData
+    """
+    angles: np.ndarray = np.arange(
+        angle_min, angle_max + angle_increment, angle_increment, dtype=np.float32
+    )  # create list of angles, float32 to keep transformed ranges float32
+
+    if len(angles) < len(laser_scan_ranges):
+        raise ValueError(
+            f"Missing laser scan ranges for angles in [{angle_min}, {angle_max}], got length {len(laser_scan_ranges)} of ranges for {len(angles)} angles"
+        )
+
+    angles = angles[: len(laser_scan_ranges)]
+
+    # Handle degenerate scans without breaking the container validators
+    if angles.size == 0:
+        return LaserScanData(
+            angle_min=angle_min,
+            angle_max=angle_max,
+            angle_increment=angle_increment,
+            range_max=max(max_scan_range, 1e-3),
+        )
+
+    # Limit ranges by max value (to remove inf values)
+    r_max = max_scan_range
+    ranges: np.ndarray = np.where(
+        laser_scan_ranges != np.inf, np.minimum(laser_scan_ranges, r_max), r_max
+    )
+
+    rotation_angle = 2 * math.atan2(rotation[2], rotation[3])
+
+    # Every beam is a point in the sensor's frame: turn it by the mount
+    # rotation and move it by the mount translation (R * p + t), then read it
+    # back as a range and a bearing. In cartesian coordinates, because a
+    # translation changes each beam's bearing by a different amount and its
+    # polar form needs the sign of both of its components
+    # NOTE: the translation is cast to a Python float, which numpy treats as a
+    # weak type: a np.float64 here would promote the float32 ranges and cost
+    # the zero-copy path downstream
+    headings = angles + rotation_angle
+    points_x = ranges * np.cos(headings) + float(translation[0])
+    points_y = ranges * np.sin(headings) + float(translation[1])
+
+    ranges_transformed = np.hypot(points_x, points_y)
+    angles_transformed = _convert_to_0_2pi(np.arctan2(points_y, points_x))
+
+    # Sort values to be compatible with laserscan format
+    sorted_indices = np.argsort(angles_transformed)
+    if not isinstance(angles_transformed, np.ndarray) or not isinstance(
+        ranges_transformed, np.ndarray
+    ):
+        raise TypeError("Cannot create laser scan data with one value")
+    sorted_angles = angles_transformed[sorted_indices]
+    sorted_ranges = ranges_transformed[sorted_indices]
+
+    # Carry intensities through the transform when they cover the scan
+    if intensities is not None and intensities.size == angles.size:
+        sorted_intensities = intensities[sorted_indices]
+    else:
+        sorted_intensities = np.empty(0)
+
+    return LaserScanData(
+        angle_min=float(np.min(sorted_angles)),
+        angle_max=float(np.max(sorted_angles)),
+        angle_increment=angle_increment,
+        angles=sorted_angles,
+        range_min=float(np.min(sorted_ranges)),
+        range_max=max(float(np.max(sorted_ranges)), 1e-3),
+        ranges=sorted_ranges,
+        intensities=sorted_intensities,
+    )
+
+
+@define
+class CameraIntrinsics(BaseAttrs):
+    """Container for sensor_msgs/CameraInfo data.
+
+    Carries the pinhole parameters that make an image metrically meaningful,
+    which is what a consumer needs to turn a pixel into a direction in space
+    (and, with a depth value, into a point).
+
+    Values are taken from the rectified projection matrix `P` when it is set,
+    falling back to the raw intrinsics `K`, and are corrected for binning and
+    for a region of interest, so they always describe the image as actually
+    published rather than the sensor's full frame.
+
+    When `P` was used the intrinsics describe the **rectified** image and
+    `distortion` is empty — feed them rectified (or registered) frames. Only
+    the `K` fallback pairs with the raw image and its distortion
+    coefficients; `distortion_model` is reported in both cases as sensor
+    metadata.
+
+    :param fx: Focal length in pixels along x
+    :param fy: Focal length in pixels along y
+    :param cx: Principal point in pixels along x
+    :param cy: Principal point in pixels along y
+    :param width: Width of the published image in pixels
+    :param height: Height of the published image in pixels
+    :param distortion_model: Distortion model named by the camera driver
+    :param distortion: Distortion coefficients, empty for a rectified image
+    :param frame_id: Optical frame the camera reports in
+    :param timestamp: Message timestamp in seconds
+    """
+
+    fx: float = field()
+    fy: float = field()
+    cx: float = field()
+    cy: float = field()
+    width: int = field(default=0)
+    height: int = field(default=0)
+    distortion_model: str = field(default="")
+    distortion: np.ndarray = field(default=Factory(lambda: np.empty(0)), eq=False)
+    frame_id: str = field(default="")
+    timestamp: float = field(default=0.0)
+
+    @property
+    def matrix(self) -> np.ndarray:
+        """Intrinsics as a 3x3 camera matrix"""
+        return np.array([
+            [self.fx, 0.0, self.cx],
+            [0.0, self.fy, self.cy],
+            [0.0, 0.0, 1.0],
+        ])
+
+    @property
+    def focal_length(self) -> np.ndarray:
+        """Focal length as (fx, fy)"""
+        return np.array([self.fx, self.fy])
+
+    @property
+    def principal_point(self) -> np.ndarray:
+        """Principal point as (cx, cy)"""
+        return np.array([self.cx, self.cy])
+
+    def matches(self, width: int, height: int) -> bool:
+        """Whether these intrinsics describe an image of the given size.
+
+        Intrinsics that do not match the image they are used with put every
+        deprojected point in the wrong place, so consumers should check.
+
+        :param width: Image width in pixels
+        :param height: Image height in pixels
+        """
+        return (self.width, self.height) == (width, height)
+
+
+def read_camera_info(msg) -> CameraIntrinsics:
+    """Read the pinhole parameters out of a sensor_msgs/CameraInfo message.
+
+    When the rectified projection ``P`` is set, the returned intrinsics
+    describe the **rectified** image. A consumer working on the raw stream of a
+    distorted camera needs ``K`` with the distortion coefficients instead,
+    which is only what this returns when the driver leaves ``P`` unset.
+
+    :param msg: sensor_msgs/CameraInfo message
+    :return: Camera intrinsics describing the published image
+    :rtype: CameraIntrinsics
+    """
+    projection = np.asarray(msg.p, dtype=np.float64)
+    intrinsics = np.asarray(msg.k, dtype=np.float64)
+    # NOTE: P describes the rectified image and is what a rectified stream should be
+    # deprojected with; K is the raw sensor matrix and the only option when a
+    # driver leaves P unset. K pairs with the raw image's coefficients, while a
+    # rectified image has no distortion left by construction
+    if projection.size == 12 and projection[0] != 0.0:
+        fx, fy = projection[0], projection[5]
+        cx, cy = projection[2], projection[6]
+        distortion = np.empty(0, dtype=np.float64)
+    else:
+        fx, fy = intrinsics[0], intrinsics[4]
+        cx, cy = intrinsics[2], intrinsics[5]
+        distortion = np.asarray(msg.d, dtype=np.float64)
+
+    width, height = msg.width, msg.height
+
+    # A region of interest moves the principal point into the sub image, and
+    # binning scales everything down with the image
+    roi = getattr(msg, "roi", None)
+    if roi is not None and (roi.width or roi.height):
+        cx -= roi.x_offset
+        cy -= roi.y_offset
+        width = roi.width or width
+        height = roi.height or height
+
+    binning_x = getattr(msg, "binning_x", 0) or 1
+    binning_y = getattr(msg, "binning_y", 0) or 1
+    if binning_x != 1 or binning_y != 1:
+        fx, cx, width = fx / binning_x, cx / binning_x, width // binning_x
+        fy, cy, height = fy / binning_y, cy / binning_y, height // binning_y
+
+    return CameraIntrinsics(
+        fx=float(fx),
+        fy=float(fy),
+        cx=float(cx),
+        cy=float(cy),
+        width=int(width),
+        height=int(height),
+        distortion_model=msg.distortion_model,
+        distortion=distortion,
+        frame_id=msg.header.frame_id,
+        timestamp=msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9,
+    )
