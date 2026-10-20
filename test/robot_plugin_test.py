@@ -17,20 +17,26 @@ import pytest
 import rclpy
 from std_msgs.msg import Int32 as RosInt32
 
+from rclpy import qos
+from ros_sugar.config import QoSConfig
 from ros_sugar.io.topic import Topic
+from ros_sugar.supported_types import LaserScan
 from ros_sugar.robot import (
     ActionRegistry,
     EventRegistry,
     Feedback,
     HttpTransport,
     InProcessFeedbackBus,
+    NativeMapping,
     PluginMetadata,
     RobotCommand,
     RobotPlugin,
     RobotPluginHost,
+    SensorPlugin,
     SdkCallbackTransport,
     SocketFeedbackBus,
     UdpTransport,
+    VendorMapping,
     create_supported_type,
 )
 
@@ -118,6 +124,32 @@ class MockPlugin(RobotPlugin):
         return Action(method=lambda: self.commands["Int32"].transport.send(
             _encode_int32(value)
         ))
+
+
+class MockSensor(SensorPlugin):
+    """A sensor plugin with no I/O of its own -- enough to be attached."""
+
+    def __init__(self, cam_name: str = "camera"):
+        self.metadata = PluginMetadata(name=cam_name)
+
+
+class MockUdpSensor(SensorPlugin):
+    """A sensor plugin with one UDP feedback -- a camera-shaped stand-in."""
+
+    def __init__(self, host: str = "127.0.0.1", state_port: int = 0):
+        self.metadata = PluginMetadata(name="MockSensor", vendor="test")
+        transport = UdpTransport(
+            "state", send_to=(host, state_port), bind=(host, state_port)
+        )
+        self.transports = {"state": transport}
+        self.feedbacks = {
+            "Int32": Feedback(
+                key="Int32",
+                msg_type=RobotInt32,
+                transport=transport,
+                decoder=_decode_int32,
+            )
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +465,96 @@ def test_inspect_cli():
 
 
 # ---------------------------------------------------------------------------
+# Mapping declarations
+# ---------------------------------------------------------------------------
+
+
+class _VendorMappingPlugin(RobotPlugin):
+    """A robot whose own software builds the map, driven by a vendor tool."""
+
+    MAPPING = VendorMapping(
+        start=["drmap", "mapping", "-b", "-n", "{name}"],
+        stop=["drmap", "stop_mapping"],
+        apply=["drmap", "apply", "{name}"],
+        after_apply=["systemctl", "restart", "localization.service"],
+        import_=["drmap", "unpack", "{path}"],
+        store="/var/opt/robot/data/maps",
+        area_limit_m=50.0,
+    )
+
+    def __init__(self):
+        self.metadata = PluginMetadata(name="VendorMapper", vendor="test")
+
+
+class _NativeMappingPlugin(RobotPlugin):
+    """A robot EMOS maps itself, from the plugin's own sensor feedbacks."""
+
+    MAPPING = NativeMapping(cloud="lidar", imu="lidar_imu", z_max=1.2)
+
+    def __init__(self):
+        self.metadata = PluginMetadata(name="NativeMapper", vendor="test")
+
+
+def test_plugin_without_mapping_describes_none():
+    """A plugin that cannot be mapped says so explicitly rather than omitting
+    the key, so a consumer never has to distinguish absent from unmappable."""
+    plugin = MockPlugin(state_port=46030, cmd_port=46031)
+    assert plugin.describe()["mapping"] is None
+
+
+def test_vendor_mapping_reaches_describe():
+    """The declaration survives into the introspection tree, tagged so a
+    consumer can tell the two providers apart."""
+    mapping = _VendorMappingPlugin().describe()["mapping"]
+    assert mapping["kind"] == "vendor"
+    assert mapping["start"] == ["drmap", "mapping", "-b", "-n", "{name}"]
+    assert mapping["after_apply"] == [
+        "systemctl",
+        "restart",
+        "localization.service",
+    ]
+    assert mapping["store"] == "/var/opt/robot/data/maps"
+    # Defaults the declaration did not set.
+    assert mapping["grid"] == "occ_grid.yaml"
+    assert mapping["cloud"] == "full_cloud.pcd"
+    assert mapping["active_link"] == "active"
+    assert mapping["requires_root"] is True
+    assert mapping["host"] == "local"
+    assert mapping["export"] is None
+    # The keyword-dodging attribute name does not leak to the CLI.
+    assert mapping["import"] == ["drmap", "unpack", "{path}"]
+    assert "import_" not in mapping
+
+
+def test_native_mapping_reaches_describe():
+    """Inputs are named by feedback key, not topic, so the plugin stays the
+    single source of truth for the topic behind them."""
+    mapping = _NativeMappingPlugin().describe()["mapping"]
+    assert mapping["kind"] == "native"
+    assert mapping["cloud"] == "lidar"
+    assert mapping["imu"] == "lidar_imu"
+    assert mapping["z_min"] == 0.15
+    assert mapping["z_max"] == 1.2
+    assert mapping["resolution"] == 0.05
+
+
+def test_native_mapping_declares_where_the_imu_sits_in_the_lidar():
+    decl = NativeMapping(cloud="lidar", imu="lidar_imu", imu_xyz=(0.011, 0.023, -0.044))
+    spec = decl.spec()
+    assert list(spec["imu_xyz"]) == [0.011, 0.023, -0.044]
+    assert list(spec["imu_rpy"]) == [0.0, 0.0, 0.0]
+    assert NativeMapping(cloud="lidar").spec()["imu_xyz"] is None
+
+
+def test_mapping_spec_is_json_serializable():
+    """``describe`` crosses into the CLI as JSON, so the mapping block must
+    survive the trip with nothing exotic in it."""
+    for plugin in (_VendorMappingPlugin(), _NativeMappingPlugin()):
+        payload = json.loads(json.dumps(plugin.describe()["mapping"]))
+        assert payload["kind"] in {"vendor", "native"}
+
+
+# ---------------------------------------------------------------------------
 # Registries
 # ---------------------------------------------------------------------------
 
@@ -484,11 +606,11 @@ def test_plugin_host_feedback_and_command_flow():
     try:
         # A consumer subscribes to the feedback channel as a component would
         decoded = []
-        from rclpy.serialization import deserialize_message
 
+        # In-process bus delivers the live decoded message object (no CDR).
         bus.subscribe(
             "robot/feedback/Int32",
-            lambda data: decoded.append(deserialize_message(data, RosInt32).data),
+            lambda msg: decoded.append(msg.data),
         )
 
         # The robot streams a telemetry packet into the plugin's bound port
@@ -550,6 +672,62 @@ def test_route_via_host_command_forwarding():
     finally:
         host.close()
         robot_cmd_sock.close()
+
+
+def test_lifecycle_hooks_fire_around_the_transports(monkeypatch):
+    """`on_detached` has to run while the transports are still open, so a
+    plugin can leave hardware in a safe state -- a spinning motor is not
+    stopped by closing the port."""
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    events = []
+
+    monkeypatch.setattr(
+        type(plugin),
+        "on_attached",
+        lambda self, node, bus: events.append("attached"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        type(plugin),
+        "on_detached",
+        lambda self, node, bus: events.append(
+            # every transport must still be usable at this point
+            f"detached:{all(t._open for t in self.transports.values())}"
+        ),
+        raising=False,
+    )
+
+    host = RobotPluginHost(plugin, node=None, bus=InProcessFeedbackBus())
+    host.open()
+    assert events == ["attached"]
+    host.close()
+    assert events == ["attached", "detached:True"]
+
+    # Both hooks are idempotent, since close() is
+    host.close()
+    assert events == ["attached", "detached:True"]
+
+
+def test_a_raising_detach_hook_does_not_block_teardown():
+    """Teardown must finish even if the device has already gone away."""
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+
+    def _boom(self, node, bus):
+        raise RuntimeError("device unplugged")
+
+    monkeypatch_target = type(plugin)
+    original = getattr(monkeypatch_target, "on_detached", None)
+    monkeypatch_target.on_detached = _boom
+    try:
+        host = RobotPluginHost(plugin, node=None, bus=InProcessFeedbackBus())
+        host.open()
+        host.close()  # must not raise
+        assert all(not t._open for t in plugin.transports.values())
+    finally:
+        if original is not None:
+            monkeypatch_target.on_detached = original
+        else:
+            del monkeypatch_target.on_detached
 
 
 # ---------------------------------------------------------------------------
@@ -946,10 +1124,13 @@ def test_use_robot_plugin_mismatch_is_contained(rclpy_context):
 
 
 class _FakeComponentConfig:
-    """Bare component config with a duck-typed ``robot`` slot."""
+    """Bare component config with the two slots the launcher broadcasts into."""
 
     def __init__(self):
+        from ros_sugar.config import RobotFrames
+
         self.robot = None
+        self.frames = RobotFrames()
 
 
 class _FakeComponent:
@@ -1000,13 +1181,13 @@ def test_recipe_override_wins_over_plugin():
     assert comp.config.robot == {"sentinel": "from_recipe"}  # untouched
 
 
-def test_plugin_without_robot_config_attr_is_noop():
-    """A plugin that doesn't expose ``robot_config`` causes no broadcast and
-    no error -- the auto-apply path is fully opt-in."""
+def test_plugin_that_describes_no_robot_is_noop():
+    """Every plugin declares ``robot_config``, but one that describes no robot
+    leaves it None -- the auto-apply path stays opt-in."""
     from ros_sugar import Launcher
 
     plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
-    assert not hasattr(plugin, "robot_config")
+    assert plugin.robot_config is None
 
     launcher = Launcher(robot_plugin=plugin)
     comp = _FakeComponent("d")
@@ -1026,3 +1207,2063 @@ def test_no_plugin_attached_is_noop():
 
     launcher._apply_plugin_robot_config()
     assert comp.config.robot is None
+
+
+# ---------------------------------------------------------------------------
+# component events on plugin-fed topics
+# ---------------------------------------------------------------------------
+
+
+def _event_component(plugin, topic, name):
+    """A component whose event watches a topic served by the plugin."""
+    from ros_sugar.core.action import Action
+    from ros_sugar.core.component import BaseComponent
+    from ros_sugar.core.event import Event
+
+    component = BaseComponent(component_name=name, inputs=[topic])
+    component.rclpy_init_node()
+    component._robot_plugin = plugin
+    component._use_robot_plugin()
+    component._add_event_action_pair(
+        Event(topic.msg.data > 10), Action(method=lambda: (True, ""))
+    )
+    return component
+
+
+def test_event_on_plugin_topic_creates_no_ros_subscription(rclpy_context):
+    """The data never travels over ROS, so a ROS subscription would sit empty."""
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    host = RobotPluginHost(plugin, node=None, bus=InProcessFeedbackBus())
+    host.open()
+
+    topic = Topic(name="robot_state", msg_type="Int32", use_plugin=True)
+    component = _event_component(plugin, topic, "plugin_event_no_sub")
+    try:
+        component._turn_on_events_management()
+        assert component._external_topics == {"robot_state"}
+        assert component._BaseComponent__event_listeners == [], (
+            "a plugin-fed event topic must not get a dead ROS subscription"
+        )
+    finally:
+        host.close()
+        component.destroy_node()
+
+
+def test_event_on_plugin_topic_fires_from_feedback_bus(rclpy_context):
+    """Regression: events on plugin feedback never fired, because the component
+    only ever subscribed to ROS."""
+    state_port = _free_port()
+    plugin = MockPlugin(state_port=state_port, cmd_port=_free_port())
+    host = RobotPluginHost(plugin, node=None, bus=InProcessFeedbackBus())
+    host.open()
+
+    topic = Topic(name="robot_state", msg_type="Int32", use_plugin=True)
+    component = _event_component(plugin, topic, "plugin_event_bus")
+    try:
+        component._turn_on_events_management()
+
+        robot_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        robot_tx.sendto(b"55", ("127.0.0.1", state_port))
+        deadline = time.time() + 2.0
+        while (
+            "robot_state" not in component._events_topics_blackboard
+            and time.time() < deadline
+        ):
+            time.sleep(0.02)
+        robot_tx.close()
+
+        entry = component._events_topics_blackboard.get("robot_state")
+        assert entry is not None, "plugin feedback never reached the event handler"
+        assert entry.msg.data == 55
+    finally:
+        host.close()
+        component.destroy_node()
+
+
+def test_event_built_by_the_plugin_fires_inside_a_component(rclpy_context):
+    """Regression: an event a plugin builds on its own feedback, as its event
+    registry does, named the feedback by channel without saying which plugin
+    it belongs to. A component given its action opened a ROS subscription on
+    the channel name, which nothing publishes, and the event never fired."""
+    from ros_sugar.core.action import Action
+    from ros_sugar.core.component import BaseComponent
+    from ros_sugar.core.event import Event
+
+    state_port = _free_port()
+    plugin = MockPlugin(state_port=state_port, cmd_port=_free_port())
+    plugin._bind_identity()  # as attaching it to a launcher does
+    host = RobotPluginHost(plugin, node=None, bus=InProcessFeedbackBus())
+    host.open()
+
+    topic = plugin.feedbacks["Int32"].as_topic()
+    component = BaseComponent(component_name="plugin_built_event")
+    component.rclpy_init_node()
+    component.add_plugin(plugin)
+    try:
+        component._use_robot_plugin()
+        component._add_event_action_pair(
+            Event(topic.msg.data > 10), Action(method=lambda: (True, ""))
+        )
+        component._turn_on_events_management()
+        assert component._BaseComponent__event_listeners == [], (
+            "a plugin-built event must not get a dead ROS subscription"
+        )
+
+        robot_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        robot_tx.sendto(b"55", ("127.0.0.1", state_port))
+        deadline = time.time() + 2.0
+        while (
+            topic.name not in component._events_topics_blackboard
+            and time.time() < deadline
+        ):
+            time.sleep(0.02)
+        robot_tx.close()
+
+        entry = component._events_topics_blackboard.get(topic.name)
+        assert entry is not None, "plugin feedback never reached the event handler"
+        assert entry.msg.data == 55
+    finally:
+        host.close()
+        component.destroy_node()
+
+
+def test_a_feedback_resolves_by_its_channel():
+    """A plugin's own events name a feedback by channel. The type fallback
+    cannot settle that when two feedbacks share a type."""
+    plugin = MockPlugin()
+    first = plugin.feedbacks["Int32"]
+    second = Feedback(
+        key="Int32_b",
+        msg_type=RobotInt32,
+        transport=plugin.transports["state"],
+        decoder=_decode_int32,
+    )
+    plugin.feedbacks["Int32_b"] = second
+    plugin._bind_identity()
+
+    assert plugin.resolve_feedback(first.channel, "Int32") is first
+    assert plugin.resolve_feedback(second.channel, "Int32") is second
+
+
+def test_event_on_a_sensor_topic_binds_to_that_sensor(rclpy_context):
+    """Regression: the event path resolved against the robot plugin whatever
+    the topic named, so a sensor's event fired on the robot's telemetry."""
+    from ros_sugar.core.action import Action
+    from ros_sugar.core.component import BaseComponent
+    from ros_sugar.core.event import Event
+
+    robot_port, cam_port = _free_port(), _free_port()
+    robot = MockPlugin(state_port=robot_port, cmd_port=_free_port(), id="lite3")
+    camera = MockUdpSensor(state_port=cam_port, id="front_cam")
+    robot._bind_identity()
+    camera._bind_identity()
+
+    bus = InProcessFeedbackBus()
+    bus.start()
+    hosts = [
+        RobotPluginHost(p, node=None, bus=bus, owns_bus=False) for p in (robot, camera)
+    ]
+    for host in hosts:
+        host.open()
+
+    topic = Topic(name="cam_state", msg_type="Int32", use_plugin=camera.id)
+    component = BaseComponent(component_name="sensor_event", inputs=[topic])
+    component.rclpy_init_node()
+    component.add_plugin(robot)
+    component.add_plugin(camera)
+    try:
+        component._use_robot_plugin()
+        component._add_event_action_pair(
+            Event(topic.msg.data > 10), Action(method=lambda: (True, ""))
+        )
+        component._turn_on_events_management()
+
+        # Only the robot transmits. Resolving against the robot plugin would
+        # deliver its telemetry to the camera's event.
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.sendto(b"55", ("127.0.0.1", robot_port))
+        time.sleep(0.5)
+        assert component._events_topics_blackboard.get("cam_state") is None, (
+            "the camera's event received the robot's telemetry"
+        )
+
+        # The camera's own data does reach it
+        tx.sendto(b"22", ("127.0.0.1", cam_port))
+        deadline = time.time() + 2.0
+        while (
+            "cam_state" not in component._events_topics_blackboard
+            and time.time() < deadline
+        ):
+            time.sleep(0.02)
+        tx.close()
+
+        entry = component._events_topics_blackboard.get("cam_state")
+        assert entry is not None, "the camera's feedback never reached its event"
+        assert entry.msg.data == 22
+    finally:
+        for host in hosts:
+            host.close()
+        bus.close()
+        component.destroy_node()
+
+
+def test_event_on_a_sensor_topic_binds_with_no_robot_plugin(rclpy_context):
+    """A sensor-only recipe has no robot plugin, which used to mean the event
+    path returned early and wired up nothing at all -- silently."""
+    from ros_sugar.core.action import Action
+    from ros_sugar.core.component import BaseComponent
+    from ros_sugar.core.event import Event
+
+    cam_port = _free_port()
+    camera = MockUdpSensor(state_port=cam_port, id="front_cam")
+    camera._bind_identity()
+
+    bus = InProcessFeedbackBus()
+    bus.start()
+    host = RobotPluginHost(camera, node=None, bus=bus, owns_bus=False)
+    host.open()
+
+    topic = Topic(name="cam_state", msg_type="Int32", use_plugin=camera.id)
+    component = BaseComponent(component_name="sensor_only_event", inputs=[topic])
+    component.rclpy_init_node()
+    component.add_plugin(camera)
+    try:
+        assert component._robot_plugin is None, "no robot plugin in this recipe"
+        component._use_robot_plugin()
+        component._add_event_action_pair(
+            Event(topic.msg.data > 10), Action(method=lambda: (True, ""))
+        )
+        component._turn_on_events_management()
+
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.sendto(b"22", ("127.0.0.1", cam_port))
+        deadline = time.time() + 2.0
+        while (
+            "cam_state" not in component._events_topics_blackboard
+            and time.time() < deadline
+        ):
+            time.sleep(0.02)
+        tx.close()
+
+        entry = component._events_topics_blackboard.get("cam_state")
+        assert entry is not None, "sensor event got no listeners at all"
+        assert entry.msg.data == 22
+    finally:
+        host.close()
+        bus.close()
+        component.destroy_node()
+
+
+def _wait_for(predicate, node=None, timeout: float = 3.0, each=None) -> None:
+    """Poll until ``predicate()``, spinning ``node`` and calling ``each`` per turn"""
+    deadline = time.time() + timeout
+    while not predicate() and time.time() < deadline:
+        if each is not None:
+            each()
+        if node is not None:
+            rclpy.spin_once(node, timeout_sec=0.05)
+        else:
+            time.sleep(0.02)
+
+
+@pytest.mark.parametrize("as_input", [True, False])
+def test_event_on_a_plugin_ros_topic_listens_where_the_plugin_publishes(
+    rclpy_context, as_input
+):
+    """Regression: an event on a topic the plugin carries over ROS subscribed
+    under the recipe's name when the topic was an input, and waited on the
+    feedback bus, where ROS-carried feedback never goes, when it was not.
+    Either way it never fired. Messages are filed under the recipe's name,
+    which is what the condition reads"""
+    from sensor_msgs.msg import LaserScan as RosLaserScan
+
+    from ros_sugar.core.action import Action
+    from ros_sugar.core.component import BaseComponent
+    from ros_sugar.core.event import Event
+
+    topic = Topic(name="lidar_front", msg_type="LaserScan", use_plugin=True)
+    component = BaseComponent(
+        component_name=f"plugin_ros_event_{'input' if as_input else 'only'}",
+        inputs=[topic] if as_input else None,
+    )
+    component.rclpy_init_node()
+    component.add_plugin(_RosCloudPlugin())
+    try:
+        component._use_robot_plugin()
+        component._add_event_action_pair(
+            Event(topic.msg.range_max > 1.0), Action(method=lambda: (True, ""))
+        )
+        component._turn_on_events_management()
+        listeners = component._BaseComponent__event_listeners
+        assert [listener.topic_name for listener in listeners] == ["/rs/front/points"]
+
+        publisher = component.create_publisher(RosLaserScan, "rs/front/points", 10)
+        board = component._events_topics_blackboard
+        _wait_for(
+            lambda: "lidar_front" in board,
+            node=component,
+            each=lambda: publisher.publish(RosLaserScan(range_max=5.0)),
+        )
+        assert "lidar_front" in board, "the plugin's scans never reached the event"
+        assert board["lidar_front"].msg.range_max == 5.0
+    finally:
+        component.destroy_node()
+
+
+def _monitor_watching(event, plugins, name):
+    """A real Monitor evaluating ``event``, given the recipe's plugins"""
+    from ros_sugar.core.monitor import Monitor
+
+    monitor = Monitor(components_names=[], events_to_emit=[event], component_name=name)
+    monitor.rclpy_init_node()
+    monitor.set_plugins({plugin.id: plugin for plugin in plugins})
+    monitor._activate_event_monitoring()
+    return monitor
+
+
+def test_monitor_event_on_a_plugin_topic_is_fed_by_the_plugin(rclpy_context):
+    """Regression: the Monitor read event topics by name alone, so an event on a
+    recipe topic the plugin serves over its own transport subscribed to a ROS
+    topic nothing publishes, and never fired"""
+    from ros_sugar.core.event import Event
+
+    state_port = _free_port()
+    plugin = MockPlugin(state_port=state_port, cmd_port=_free_port())
+    plugin._bind_identity()
+    topic = Topic(name="robot_state", msg_type="Int32", use_plugin=True)
+    monitor = _monitor_watching(Event(topic.msg.data > 10), [plugin], "plugin_monitor_one")
+    host = RobotPluginHost(
+        plugin,
+        node=None,
+        bus=InProcessFeedbackBus(),
+        monitor_feed=monitor.feed_external_topic,
+    )
+    host.open()
+    try:
+        assert monitor._Monitor__event_listeners == {}, (
+            "a plugin-fed event topic must not get a dead ROS subscription"
+        )
+        board = monitor._events_topics_blackboard
+        robot_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _wait_for(
+            lambda: "robot_state" in board,
+            each=lambda: robot_tx.sendto(b"55", ("127.0.0.1", state_port)),
+        )
+        robot_tx.close()
+        assert "robot_state" in board, "plugin feedback never reached the event"
+        assert board["robot_state"].msg.data == 55
+    finally:
+        host.close()
+        monitor.destroy_node()
+
+
+def test_monitor_event_over_several_plugin_topics_reads_each_from_its_plugin(
+    rclpy_context,
+):
+    """One condition over a topic the robot carries on ROS and one a sensor
+    serves over its own transport: each is bound to its own plugin, and both
+    arrive under the recipe's names"""
+    from sensor_msgs.msg import LaserScan as RosLaserScan
+
+    from ros_sugar.core.event import Event
+
+    robot = _RosCloudPlugin()
+    robot._bind_identity()
+    cam_port = _free_port()
+    camera = MockUdpSensor(state_port=cam_port, id="front_cam")
+    camera._bind_identity()
+    lidar = Topic(name="lidar_front", msg_type="LaserScan", use_plugin=True)
+    cam = Topic(name="cam_state", msg_type="Int32", use_plugin=camera.id)
+    monitor = _monitor_watching(
+        Event((lidar.msg.range_max > 1.0) & (cam.msg.data > 10)),
+        [robot, camera],
+        "plugin_monitor_two",
+    )
+    host = RobotPluginHost(
+        camera,
+        node=None,
+        bus=InProcessFeedbackBus(),
+        monitor_feed=monitor.feed_external_topic,
+    )
+    host.open()
+    try:
+        listeners = monitor._Monitor__event_listeners
+        assert list(listeners) == ["lidar_front"]
+        assert listeners["lidar_front"].topic_name == "/rs/front/points"
+
+        board = monitor._events_topics_blackboard
+        publisher = monitor.create_publisher(RosLaserScan, "rs/front/points", 10)
+        cam_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        def _send():
+            publisher.publish(RosLaserScan(range_max=5.0))
+            cam_tx.sendto(b"22", ("127.0.0.1", cam_port))
+
+        _wait_for(
+            lambda: "lidar_front" in board and "cam_state" in board,
+            node=monitor,
+            each=_send,
+        )
+        cam_tx.close()
+        assert board.get("lidar_front") is not None, "the robot's scans never arrived"
+        assert board.get("cam_state") is not None, "the camera's feedback never arrived"
+        assert board["lidar_front"].msg.range_max == 5.0
+        assert board["cam_state"].msg.data == 22
+    finally:
+        host.close()
+        monitor.destroy_node()
+
+
+def test_the_launcher_checks_and_requests_the_plugin_topics_events_read():
+    """An event's plugin topic is checked against the attached plugins like a
+    component's, and the plugin is asked to serve it"""
+    from ros_sugar import Launcher
+    from ros_sugar.core.action import Action
+    from ros_sugar.core.event import Event
+
+    topic = Topic(name="lidar_front", msg_type="LaserScan", use_plugin=True)
+    event = Event(topic.msg.range_max > 1.0)
+
+    without = Launcher()
+    without._events_actions[event] = [Action(method=lambda: (True, ""))]
+    with pytest.raises(ValueError, match="Event .* asks for the robot plugin"):
+        without._validate_plugin_references()
+
+    robot = _RosCloudPlugin()
+    launcher = Launcher(robot_plugin=robot)
+    launcher._events_actions[event] = [Action(method=lambda: (True, ""))]
+    launcher._validate_plugin_references()
+    launcher._resolve_plugin_demand()
+    assert robot.requested_feedbacks == {"lidar_front"}
+
+
+# ---------------------------------------------------------------------------
+# plugin-supplied robot description
+# ---------------------------------------------------------------------------
+
+
+class _DescribingPlugin(RobotPlugin):
+    """A plugin that knows the robot it drives."""
+
+    def __init__(self):
+        from ros_sugar.config import (
+            AngularCtrlLimits,
+            LinearCtrlLimits,
+            RobotConfig,
+            RobotGeometryType,
+            RobotType,
+        )
+        import numpy as np
+
+        self.metadata = PluginMetadata(name="DescribingPlugin")
+        self.robot_config = RobotConfig(
+            model_type=RobotType.DIFFERENTIAL_DRIVE,
+            geometry_type=RobotGeometryType.BOX,
+            geometry_params=np.array([0.61, 0.37, 0.4]),
+            ctrl_vx_limits=LinearCtrlLimits(max_vel=1.0, max_acc=2.5, max_decel=7.5),
+            ctrl_omega_limits=AngularCtrlLimits(
+                max_omega=1.5, max_acc=2.5, max_decel=4.0, max_ang=1.57
+            ),
+        )
+        self.base_frame = "lite3_base"
+
+
+def test_plugin_describes_robot_via_declared_fields():
+    """Both are declared members, so a plugin author has something to populate
+    and the launcher has something to type against."""
+    plugin = _DescribingPlugin()
+    assert plugin.robot_config is not None
+    assert plugin.base_frame == "lite3_base"
+
+    bare = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    assert bare.robot_config is None and bare.base_frame is None
+
+
+def test_plugin_base_frame_applied_but_not_world_frame():
+    """A robot knows its own body frame; where it has been placed is not its
+    call, so the world frame must be left alone."""
+    from ros_sugar import Launcher
+
+    launcher = Launcher(robot_plugin=_DescribingPlugin())
+    comp = _FakeComponent("base_frame_component")
+    launcher._components = [comp]
+
+    launcher._apply_plugin_robot_config()
+    launcher._apply_plugin_base_frame()
+
+    assert comp.config.robot is not None
+    assert comp.config.frames.robot_base == "lite3_base"
+    assert comp.config.frames.world == "map", "world frame is not the robot's to set"
+
+
+def test_plugin_base_frame_wins_over_recipe():
+    """The plugin stamps its telemetry in its own body frame and mounts are
+    parented on it, so a recipe cannot rename it from the outside."""
+    from ros_sugar import Launcher
+    from ros_sugar.config import RobotFrames
+
+    launcher = Launcher(robot_plugin=_DescribingPlugin())
+    comp = _FakeComponent("plugin_wins_component")
+    launcher._components = [comp]
+
+    launcher.frames = RobotFrames(robot_base="from_recipe", world="office")
+    launcher._apply_plugin_base_frame()  # would normally fire at bringup
+
+    assert comp.config.frames.robot_base == "lite3_base"
+    assert comp.config.frames.world == "office", "world is still the recipe's"
+
+
+def test_naming_only_the_world_frame_keeps_the_plugin_base_frame():
+    """The regression this precedence exists for: a recipe that assigns
+    `frames` to choose a world frame used to silently drop the plugin's body
+    frame, leaving mounts parented on a frame nothing looked up."""
+    from ros_sugar import Launcher
+    from ros_sugar.config import RobotFrames
+
+    launcher = Launcher(robot_plugin=_DescribingPlugin())
+    comp = _FakeComponent("world_only_component")
+    launcher._components = [comp]
+
+    launcher.frames = RobotFrames(world="odom")
+    launcher._apply_plugin_base_frame()
+
+    assert comp.config.frames.robot_base == "lite3_base"
+    assert comp.config.frames.world == "odom"
+
+
+def test_renaming_the_frame_on_the_plugin_is_the_way_to_override():
+    """The escape hatch: rename it where telemetry and mounts both read it."""
+    from ros_sugar import Launcher
+
+    plugin = _DescribingPlugin()
+    plugin.base_frame = "base_link"
+    launcher = Launcher(robot_plugin=plugin)
+    comp = _FakeComponent("renamed_frame_component")
+    launcher._components = [comp]
+
+    launcher._apply_plugin_base_frame()
+
+    assert comp.config.frames.robot_base == "base_link"
+
+
+def test_world_frame_setter_leaves_the_robot_frame_alone():
+    from ros_sugar import Launcher
+
+    launcher = Launcher(robot_plugin=_DescribingPlugin())
+    comp = _FakeComponent("world_setter_component")
+    launcher._components = [comp]
+
+    launcher.world_frame = "odom"
+    launcher._apply_plugin_base_frame()
+
+    assert comp.config.frames.world == "odom"
+    assert comp.config.frames.robot_base == "lite3_base"
+    assert launcher.world_frame == {"world_setter_component": "odom"}
+
+
+def test_frames_set_before_a_component_is_added_still_reach_it():
+    """A recipe may name its frames before adding its components. Those
+    added later get every setting at bringup, applied in the order the recipe
+    made them, and the plugin's body frame still wins"""
+    from ros_sugar import Launcher
+    from ros_sugar.config import RobotFrames
+
+    launcher = Launcher(robot_plugin=_DescribingPlugin())
+    early = _FakeComponent("frames_early_component")
+    launcher._components = [early]
+    launcher.robot_frame = "chassis"
+    launcher.frames = RobotFrames(robot_base="from_recipe", world="office")
+    launcher.world_frame = "odom"
+
+    late = _FakeComponent("frames_late_component")
+    launcher._components.append(late)
+    # What bringup runs, in its order
+    launcher._apply_recipe_frames()
+    launcher._apply_plugin_base_frame()
+
+    for component in (early, late):
+        assert component.config.frames.world == "odom", component.node_name
+        assert component.config.frames.robot_base == "lite3_base", component.node_name
+
+
+def test_frames_set_before_a_component_is_added_without_a_plugin():
+    from ros_sugar import Launcher
+    from ros_sugar.config import RobotFrames
+
+    launcher = Launcher()
+    launcher.frames = RobotFrames(world="odom")
+    launcher.robot_frame = "chassis"
+
+    late = _FakeComponent("frames_late_no_plugin_component")
+    launcher._components = [late]
+    launcher._apply_recipe_frames()
+
+    assert late.config.frames.world == "odom"
+    assert late.config.frames.robot_base == "chassis"
+
+
+def test_robot_frame_setter_applies_without_a_plugin():
+    from ros_sugar import Launcher
+
+    launcher = Launcher()
+    comp = _FakeComponent("robot_setter_component")
+    launcher._components = [comp]
+
+    launcher.robot_frame = "chassis"
+    launcher._apply_plugin_base_frame()  # no plugin attached, so a no-op
+
+    assert comp.config.frames.robot_base == "chassis"
+    assert launcher.robot_frame == {"robot_setter_component": "chassis"}
+
+
+@pytest.mark.parametrize("bad", ["", None, 3])
+def test_frame_setters_reject_non_frame_names(bad):
+    from ros_sugar import Launcher
+
+    launcher = Launcher()
+    launcher._components = [_FakeComponent("bad_frame_component")]
+
+    with pytest.raises(ValueError):
+        launcher.world_frame = bad
+
+
+def test_plugin_without_base_frame_leaves_frames_untouched():
+    from ros_sugar import Launcher
+
+    launcher = Launcher(robot_plugin=MockPlugin(
+        state_port=_free_port(), cmd_port=_free_port()
+    ))
+    comp = _FakeComponent("no_base_frame_component")
+    launcher._components = [comp]
+
+    launcher._apply_plugin_base_frame()
+
+    assert comp.config.frames.robot_base == "base_link"
+
+
+# ---------------------------------------------------------------------------
+# plugin taxonomy
+# ---------------------------------------------------------------------------
+
+
+def test_role_comes_from_the_base_class_not_the_recipe():
+    """Role is intrinsic: a plugin *is* a robot or a sensor by construction, so
+    a recipe cannot attach one under the wrong role."""
+    from ros_sugar.robot import Plugin, PluginRole, RobotPlugin, SensorPlugin
+
+    assert RobotPlugin._role is PluginRole.ROBOT
+    assert SensorPlugin._role is PluginRole.SENSOR
+    assert Plugin._role is PluginRole.SENSOR
+
+    class MyRobot(RobotPlugin):
+        pass
+
+    class MyCamera(SensorPlugin):
+        pass
+
+    assert MyRobot().role is PluginRole.ROBOT
+    assert MyCamera().role is PluginRole.SENSOR
+
+    # read-only: a recipe cannot reassign what a plugin is
+    with pytest.raises(AttributeError):
+        MyCamera().role = PluginRole.ROBOT
+
+
+def test_only_robot_plugins_describe_a_robot():
+    """A camera has no geometry or velocity envelope of its own, so those slots
+    exist only where they mean something."""
+    from ros_sugar.robot import RobotPlugin, SensorPlugin
+
+    class MyRobot(RobotPlugin):
+        pass
+
+    class MyCamera(SensorPlugin):
+        pass
+
+    robot = MyRobot()
+    assert robot.robot_config is None and robot.base_frame is None
+
+    camera = MyCamera()
+    assert not hasattr(camera, "robot_config")
+    assert not hasattr(camera, "base_frame")
+
+
+def test_subclass_without_its_own_init_still_reports_its_own_name():
+    """Regression guard for the __init_subclass__ move: the framework's own
+    base classes must stay unwrapped, or a plugin that defines no ``__init__``
+    would be initialized against its base and take the base's name."""
+    from ros_sugar.robot import RobotPlugin, SensorPlugin
+
+    class BareRobot(RobotPlugin):
+        pass
+
+    class BareSensor(SensorPlugin):
+        pass
+
+    assert BareRobot().metadata.name == "BareRobot"
+    assert BareSensor().metadata.name == "BareSensor"
+
+
+def test_describe_reports_the_role():
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    assert plugin.describe()["role"] == "robot"
+
+
+def test_role_survives_the_spec_round_trip():
+    """Components rebuild plugins from a spec in their own process; the role
+    has to come back with them."""
+    from ros_sugar.robot import Plugin, PluginRole
+
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    rebuilt = Plugin.from_spec(plugin.to_spec())
+    assert rebuilt.role is PluginRole.ROBOT
+
+
+# ---------------------------------------------------------------------------
+# shared bus lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_second_host_on_a_shared_bus_opens(rclpy_context):
+    """Regression: with each host starting the bus itself, the second one
+    re-bound the same address and died with 'Address already in use'."""
+    bus = SocketFeedbackBus()
+    bus.start()
+    hosts = []
+    try:
+        for _ in range(2):
+            plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+            host = RobotPluginHost(plugin, node=None, bus=bus, owns_bus=False)
+            host.open()
+            hosts.append(host)
+        assert all(h._active for h in hosts)
+    finally:
+        for host in hosts:
+            host.close()
+        bus.close()
+
+
+def test_one_host_closing_leaves_the_shared_bus_up(rclpy_context):
+    """Regression: the first host to close tore the bus down for every other
+    plugin still using it."""
+    state_port = _free_port()
+    bus = InProcessFeedbackBus()
+    bus.start()
+
+    first = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    second = MockPlugin(state_port=state_port, cmd_port=_free_port())
+    host_a = RobotPluginHost(first, node=None, bus=bus, owns_bus=False)
+    host_b = RobotPluginHost(second, node=None, bus=bus, owns_bus=False)
+    host_a.open()
+    host_b.open()
+
+    received = []
+    handle = bus.subscribe(second.feedbacks["Int32"].channel, received.append)
+    try:
+        host_a.close()  # the other plugin must keep working
+
+        robot_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        robot_tx.sendto(b"77", ("127.0.0.1", state_port))
+        deadline = time.time() + 2.0
+        while not received and time.time() < deadline:
+            time.sleep(0.02)
+        robot_tx.close()
+        assert received, "closing one host silenced the surviving plugin"
+    finally:
+        handle.unsubscribe()
+        host_b.close()
+        bus.close()
+
+
+def test_standalone_host_still_owns_its_bus(rclpy_context):
+    """A lone host with no launcher around it must remain self-contained."""
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    bus = InProcessFeedbackBus()
+    host = RobotPluginHost(plugin, node=None, bus=bus)
+    host.open()
+    assert host._active
+    host.close()
+    assert not host._active
+
+
+# ---------------------------------------------------------------------------
+# plugin identity
+# ---------------------------------------------------------------------------
+
+
+def test_unattached_plugin_keeps_the_bare_channel_form():
+    """A plugin that was never attached has no id, and its channels stay in the
+    form a single-plugin recipe has always used."""
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    assert plugin.feedbacks["Int32"].channel == "robot/feedback/Int32"
+    assert plugin.commands["Int32"].channel == "robot/command/Int32"
+
+
+def test_binding_identity_namespaces_every_channel():
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="front_cam")
+    plugin._bind_identity()
+
+    assert plugin.id == "front_cam"
+    assert plugin.feedbacks["Int32"].channel == "plugin/front_cam/feedback/Int32"
+    assert plugin.commands["Int32"].channel == "plugin/front_cam/command/Int32"
+
+
+def test_two_plugins_of_the_same_class_do_not_collide():
+    """The whole point: several plugins share one bus, so identical feedback
+    keys must resolve to different channels."""
+    a = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="cam_a")
+    b = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="cam_b")
+    a._bind_identity()
+    b._bind_identity()
+
+    assert a.feedbacks["Int32"].channel != b.feedbacks["Int32"].channel
+    assert a.commands["Int32"].channel != b.commands["Int32"].channel
+
+
+def test_namespaced_channel_is_a_valid_ros_topic_name():
+    """Channels become ROS topic names for events, and an invalid one fails at
+    activation rather than when the recipe runs."""
+    from rclpy.validate_topic_name import validate_topic_name
+
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="front_cam")
+    plugin._bind_identity()
+    validate_topic_name(f"/{plugin.feedbacks['Int32'].channel}")
+
+
+@pytest.mark.parametrize("bad_id", ["front-cam", "office.cam", "2nd_cam", ""])
+def test_ids_that_are_not_valid_ros_tokens_are_rejected(bad_id):
+    with pytest.raises(ValueError, match="not a usable plugin id"):
+        MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id=bad_id)
+
+
+def test_rebinding_after_a_topic_was_handed_out_raises():
+    """Silent-failure guard: an event built before attaching embeds the old
+    channel name, and the Monitor blackboard is keyed by topic name -- so a
+    later rename would leave the event listening to nothing, with no error."""
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="front_cam")
+    plugin.feedbacks["Int32"].as_topic()  # what building an event does
+
+    with pytest.raises(ValueError, match="has already been referenced"):
+        plugin._bind_identity()
+
+
+def test_binding_the_same_identity_twice_is_allowed():
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="front_cam")
+    plugin._bind_identity()
+    plugin.feedbacks["Int32"].as_topic()
+    plugin._bind_identity()  # no-op, must not raise
+
+
+def test_identity_survives_the_spec_round_trip():
+    """The component subprocess must subscribe to the same channels the host
+    publishes on."""
+    from ros_sugar.robot import Plugin
+
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="front_cam")
+    plugin._bind_identity()
+
+    rebuilt = Plugin.from_spec(plugin.to_spec())
+    assert rebuilt.id == "front_cam"
+    assert rebuilt.feedbacks["Int32"].channel == plugin.feedbacks["Int32"].channel
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("Lite3", "lite3"),
+        ("HikVision PTZ-2", "hikvision_ptz_2"),
+        ("  spaced  name  ", "spaced_name"),
+        ("2nd camera", "_2nd_camera"),
+    ],
+)
+def test_display_names_become_usable_ids(name, expected):
+    from ros_sugar.robot.plugin import _slug
+
+    assert _slug(name) == expected
+
+
+# ---------------------------------------------------------------------------
+# component holds several plugins
+# ---------------------------------------------------------------------------
+
+
+def _sensor_plugin(name: str) -> "MockSensor":
+    return MockSensor(cam_name=name)
+
+
+def test_component_keeps_plugins_in_a_dict(rclpy_context):
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(component_name="multi_plugin_component")
+    component.rclpy_init_node()
+    try:
+        robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+        camera = _sensor_plugin("front_cam")
+        component.add_plugin(robot)
+        component.add_plugin(camera)
+
+        assert set(component._plugins) == {"mockplugin", "front_cam"}
+    finally:
+        component.destroy_node()
+
+
+def test_robot_plugin_property_reads_and_writes_through(rclpy_context):
+    """Existing code and tests assign ``component._robot_plugin`` directly, and
+    the out-of-tree Lite3 republisher reads it."""
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(component_name="robot_plugin_property_component")
+    component.rclpy_init_node()
+    try:
+        assert component._robot_plugin is None
+
+        robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+        component._robot_plugin = robot
+        assert component._robot_plugin is robot
+
+        component._robot_plugin = None
+        assert component._robot_plugin is None
+        assert component._plugins == {}
+    finally:
+        component.destroy_node()
+
+
+def test_setting_the_robot_plugin_leaves_sensors_attached(rclpy_context):
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(component_name="mixed_plugin_component")
+    component.rclpy_init_node()
+    try:
+        camera = _sensor_plugin("front_cam")
+        component.add_plugin(camera)
+        component._robot_plugin = MockPlugin(
+            state_port=_free_port(), cmd_port=_free_port()
+        )
+        component._robot_plugin = None  # clearing the robot must not drop the camera
+
+        assert component._plugins == {"front_cam": camera}
+    finally:
+        component.destroy_node()
+
+
+def test_a_sensor_only_component_still_binds_its_plugins(rclpy_context):
+    """The plugin gates used to key on the *robot* plugin, so a recipe with
+    only sensors would have skipped plugin wiring entirely."""
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(component_name="sensor_only_component")
+    component.rclpy_init_node()
+    try:
+        component.add_plugin(_sensor_plugin("front_cam"))
+        assert component._robot_plugin is None
+        assert component._plugins, "gates must key on _plugins, not the robot plugin"
+        assert component._plugins_json != "{}"
+    finally:
+        component.destroy_node()
+
+
+def test_plugins_round_trip_across_the_process_boundary(rclpy_context):
+    """Multiprocess launch serializes plugins into argv and rebuilds them in
+    the component subprocess."""
+    from ros_sugar.core.component import BaseComponent
+
+    sender = BaseComponent(component_name="plugins_json_sender")
+    sender.rclpy_init_node()
+    receiver = BaseComponent(component_name="plugins_json_receiver")
+    receiver.rclpy_init_node()
+    try:
+        robot = MockPlugin(
+            state_port=_free_port(), cmd_port=_free_port(), id="lite3"
+        )
+        robot._bind_identity()
+        sender.add_plugin(robot)
+        sender.add_plugin(MockSensor(cam_name="HikVision", id="front_cam"))
+
+        receiver._plugins_json = sender._plugins_json
+
+        assert set(receiver._plugins) == {"lite3", "front_cam"}
+        assert receiver._robot_plugin is not None
+        # the identity has to come back, or the subprocess subscribes to
+        # channels the host never publishes on
+        assert receiver._robot_plugin.id == "lite3"
+        assert (
+            receiver._robot_plugin.feedbacks["Int32"].channel
+            == "plugin/lite3/feedback/Int32"
+        )
+    finally:
+        sender.destroy_node()
+        receiver.destroy_node()
+
+
+# ---------------------------------------------------------------------------
+# launcher holds several plugins
+# ---------------------------------------------------------------------------
+
+
+def _launcher_with(components):
+    from ros_sugar import Launcher
+
+    launcher = Launcher()
+    launcher._components = components
+    return launcher
+
+
+def test_add_plugin_order_does_not_matter(rclpy_context):
+    """Regression: plugins used to be handed out inside add_pkg, so a recipe
+    that called add_pkg first left those components with nothing."""
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(component_name="ordering_component")
+    component.rclpy_init_node()
+    try:
+        # components registered BEFORE any plugin is attached
+        launcher = _launcher_with([component])
+        launcher.add_plugin(MockPlugin(state_port=_free_port(), cmd_port=_free_port()))
+        launcher.add_plugin(MockSensor(cam_name="front_cam"))
+
+        assert component._plugins == {}, "distribution happens at bringup"
+        launcher._distribute_plugins()
+        assert set(component._plugins) == {"mockplugin", "front_cam"}
+    finally:
+        component.destroy_node()
+
+
+def test_only_one_robot_plugin_per_recipe(rclpy_context):
+    launcher = _launcher_with([])
+    launcher.add_plugin(MockPlugin(state_port=_free_port(), cmd_port=_free_port()))
+
+    with pytest.raises(ValueError, match="a recipe describes one robot"):
+        launcher.add_plugin(
+            MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="second")
+        )
+
+
+def test_several_sensor_plugins_are_allowed(rclpy_context):
+    launcher = _launcher_with([])
+    launcher.add_plugin(MockSensor(cam_name="cam_a"))
+    launcher.add_plugin(MockSensor(cam_name="cam_b"))
+
+    assert set(launcher._plugins) == {"cam_a", "cam_b"}
+
+
+def test_duplicate_names_are_rejected(rclpy_context):
+    launcher = _launcher_with([])
+    launcher.add_plugin(MockSensor(cam_name="cam"))
+
+    with pytest.raises(ValueError, match="already taken"):
+        launcher.add_plugin(MockSensor(cam_name="cam"))
+
+
+def test_two_plugins_of_one_kind_need_distinct_names(rclpy_context):
+    """Two identical cameras default to the same slug, so the recipe names
+    them -- and that name is what namespaces their channels."""
+    launcher = _launcher_with([])
+    launcher.add_plugin(MockSensor(cam_name="HikVision PTZ", id="front_cam"))
+    launcher.add_plugin(MockSensor(cam_name="HikVision PTZ", id="rear_cam"))
+
+    assert set(launcher._plugins) == {"front_cam", "rear_cam"}
+    assert launcher._plugins["front_cam"].id == "front_cam"
+    assert launcher._plugins["rear_cam"].id == "rear_cam"
+
+
+def test_attaching_binds_identity_immediately(rclpy_context):
+    """Identity must be final when add_plugin returns: events built from the
+    plugin freeze their topic names before plugin setup runs."""
+    launcher = _launcher_with([])
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    launcher.add_plugin(plugin)
+
+    assert plugin.id == "mockplugin"
+    assert plugin.feedbacks["Int32"].channel == "plugin/mockplugin/feedback/Int32"
+
+
+def test_launcher_robot_plugin_property_round_trips(rclpy_context):
+    """ros-agents reads and writes ``launcher._robot_plugin`` directly."""
+    from ros_sugar import Launcher
+
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    launcher = Launcher(robot_plugin=plugin)
+    assert launcher._robot_plugin is plugin
+
+    launcher._robot_plugin = None
+    assert launcher._robot_plugin is None
+
+
+# ---------------------------------------------------------------------------
+# addressing a specific plugin from a topic
+# ---------------------------------------------------------------------------
+
+
+def test_topic_rejects_an_empty_plugin_id():
+    """`use_plugin` is tested for truthiness, so "" would silently mean off."""
+    with pytest.raises(ValueError, match="cannot be an empty string"):
+        Topic(name="x", msg_type="Int32", use_plugin="")
+
+
+def test_use_plugin_survives_the_topic_round_trip():
+    """Topics are rebuilt from JSON in every component subprocess."""
+    original = Topic(name="x", msg_type="Int32", use_plugin="front_cam")
+    rebuilt = Topic(**{
+        **json.loads(original.to_json()),
+        "qos_profile": original.qos_profile,
+        "additional_types": [],
+    })
+    assert rebuilt.use_plugin == "front_cam"
+
+    plain = Topic(name="y", msg_type="Int32", use_plugin=True)
+    assert json.loads(plain.to_json())["use_plugin"] is True
+
+
+def test_component_binds_each_topic_to_the_named_plugin(rclpy_context):
+    """The point of step 8: two plugins attached, each topic reaching the one
+    it names."""
+    from ros_sugar.core.component import BaseComponent
+
+    robot_port, cam_port = _free_port(), _free_port()
+    robot = MockPlugin(state_port=robot_port, cmd_port=_free_port(), id="lite3")
+    camera = MockPlugin(state_port=cam_port, cmd_port=_free_port(), id="front_cam")
+
+    # what Launcher.add_plugin does: namespace each plugin's channels so two
+    # plugins exposing the same feedback key cannot collide on the shared bus
+    robot._bind_identity()
+    camera._bind_identity()
+
+    bus = InProcessFeedbackBus()
+    bus.start()
+    hosts = [
+        RobotPluginHost(p, node=None, bus=bus, owns_bus=False) for p in (robot, camera)
+    ]
+    for host in hosts:
+        host.open()
+
+    component = BaseComponent(
+        component_name="two_plugin_component",
+        inputs=[
+            Topic(name="robot_state", msg_type="Int32", use_plugin=True),
+            Topic(name="cam_state", msg_type="Int32", use_plugin=camera.id),
+        ],
+    )
+    component.rclpy_init_node()
+    component.add_plugin(robot)
+    component.add_plugin(camera)
+    try:
+        component._use_robot_plugin()
+        assert component._external_topics == {"robot_state", "cam_state"}
+
+        # each input receives only its own plugin's telemetry
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.sendto(b"11", ("127.0.0.1", robot_port))
+        tx.sendto(b"22", ("127.0.0.1", cam_port))
+        deadline = time.time() + 2.0
+        while (
+            component.callbacks["robot_state"].msg is None
+            or component.callbacks["cam_state"].msg is None
+        ) and time.time() < deadline:
+            time.sleep(0.02)
+        tx.close()
+
+        assert component.callbacks["robot_state"].get_output() == 11
+        assert component.callbacks["cam_state"].get_output() == 22
+    finally:
+        for host in hosts:
+            host.close()
+        bus.close()
+        component.destroy_node()
+
+
+def test_topic_naming_an_unattached_plugin_is_caught_at_bringup(rclpy_context):
+    """Falling back to a ROS topic nothing publishes leaves the component
+    looking healthy while receiving nothing, so fail in the recipe instead."""
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(
+        component_name="typo_component",
+        inputs=[Topic(name="Image", msg_type="Int32", use_plugin="front_cm")],
+    )
+    component.rclpy_init_node()
+    try:
+        launcher = _launcher_with([component])
+        launcher.add_plugin(MockSensor(cam_name="HikVision", id="front_cam"))
+
+        with pytest.raises(ValueError, match="not attached to this recipe"):
+            launcher._validate_plugin_references()
+    finally:
+        component.destroy_node()
+
+
+def test_use_plugin_true_without_a_robot_plugin_is_caught_at_bringup(rclpy_context):
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(
+        component_name="no_robot_component",
+        inputs=[Topic(name="Image", msg_type="Int32", use_plugin=True)],
+    )
+    component.rclpy_init_node()
+    try:
+        launcher = _launcher_with([component])
+        launcher.add_plugin(MockSensor(cam_name="HikVision", id="front_cam"))
+
+        with pytest.raises(ValueError, match="no robot plugin is attached"):
+            launcher._validate_plugin_references()
+    finally:
+        component.destroy_node()
+
+
+def test_plugin_resources_are_released_when_setup_fails(monkeypatch):
+    """Setup opens the plugin hosts, bus and shared memory, so a failure after
+    that must still close them (issue #66)"""
+    from unittest.mock import MagicMock
+
+    from ros_sugar.core.component import BaseComponent
+
+    launcher = _launcher_with([BaseComponent(component_name="setup_fails_component")])
+    host, bus, shm = MagicMock(), MagicMock(), MagicMock()
+
+    def _failing_setup():
+        launcher._plugin_hosts.append(host)
+        launcher._plugin_bus, launcher._plugin_shm = bus, shm
+        raise RuntimeError("setup failed after opening the plugins")
+
+    monkeypatch.setattr(launcher, "setup_launch_description", _failing_setup)
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        launcher.bringup()
+
+    host.close.assert_called_once()
+    bus.close.assert_called_once()
+    shm.close.assert_called_once()
+    assert not launcher._plugin_hosts
+    assert launcher._plugin_bus is None and launcher._plugin_shm is None
+
+
+# ---------------------------------------------------------------------------
+# sensor frames and mounts
+# ---------------------------------------------------------------------------
+
+
+def test_sensor_frame_defaults_to_its_id():
+    """Two instances of one sensor get distinct frames with no author effort."""
+    a = MockSensor(cam_name="HikVision", id="front_cam")
+    b = MockSensor(cam_name="HikVision", id="rear_cam")
+    assert a.frame_id == "front_cam_frame"
+    assert b.frame_id == "rear_cam_frame"
+
+
+def test_sensor_frame_can_be_named_by_the_recipe():
+    cam = MockSensor(cam_name="HikVision", id="front_cam", frame_id="front_optical")
+    assert cam.frame_id == "front_optical"
+
+
+def test_sensor_frame_survives_the_spec_round_trip():
+    from ros_sugar.robot import Plugin
+
+    cam = MockSensor(cam_name="HikVision", id="front_cam", frame_id="front_optical")
+    rebuilt = Plugin.from_spec(cam.to_spec())
+    assert rebuilt.frame_id == "front_optical"
+
+
+def test_unstamped_feedback_is_stamped_with_the_plugin_frame(rclpy_context):
+    """Regression: an unstamped message is silently never transformed -- the
+    component's frame resolver returns None on an empty frame_id."""
+    from std_msgs.msg import Header
+    from sensor_msgs.msg import Imu
+
+    port = _free_port()
+
+    def _decode_imu(raw: bytes):
+        msg = Imu()
+        msg.header = Header()  # deliberately unstamped, as a decoder often is
+        msg.linear_acceleration.x = float(raw.decode())
+        return msg
+
+    RobotImu = create_supported_type(Imu)
+
+    class ImuSensor(SensorPlugin):
+        def __init__(self, imu_port: int):
+            self.metadata = PluginMetadata(name="IMU")
+            transport = UdpTransport(
+                "imu", send_to=("127.0.0.1", imu_port), bind=("127.0.0.1", imu_port)
+            )
+            self.transports = {"imu": transport}
+            self.feedbacks = {
+                "Imu": Feedback(
+                    key="Imu",
+                    msg_type=RobotImu,
+                    transport=transport,
+                    decoder=_decode_imu,
+                )
+            }
+
+    sensor = ImuSensor(imu_port=port, id="waist_imu")
+    sensor._bind_identity()
+    bus = InProcessFeedbackBus()
+    bus.start()
+    host = RobotPluginHost(sensor, node=None, bus=bus, owns_bus=False)
+    host.open()
+
+    received = []
+    handle = bus.subscribe(sensor.feedbacks["Imu"].channel, received.append)
+    try:
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.sendto(b"9", ("127.0.0.1", port))
+        deadline = time.time() + 2.0
+        while not received and time.time() < deadline:
+            time.sleep(0.02)
+        tx.close()
+        assert received, "no feedback arrived"
+
+        # In-process bus delivers the live decoded message object (no CDR).
+        msg = received[0]
+        assert msg.header.frame_id == "waist_imu_frame"
+    finally:
+        handle.unsubscribe()
+        host.close()
+        bus.close()
+
+
+def test_a_decoder_that_stamps_its_own_frame_is_never_overridden(rclpy_context):
+    """A robot's odometry is in the localization frame, not a body frame --
+    only the decoder knows that, so the framework must not overwrite it."""
+    from sensor_msgs.msg import Imu
+
+    RobotImu2 = create_supported_type(Imu, module=__name__)
+
+    feedback = Feedback(
+        key="Imu",
+        msg_type=RobotImu2,
+        transport=UdpTransport("x", send_to=("127.0.0.1", 1)),
+        decoder=lambda _: None,
+        frame_id="declared_frame",
+    )
+    host = RobotPluginHost(
+        MockSensor(cam_name="s", id="s"), node=None, bus=InProcessFeedbackBus()
+    )
+
+    msg = Imu()
+    msg.header.frame_id = "author_stamped"
+    host._stamp_header(feedback, msg)
+    assert msg.header.frame_id == "author_stamped"
+
+    fresh = Imu()
+    host._stamp_header(feedback, fresh)
+    assert fresh.header.frame_id == "declared_frame", "per-feedback frame wins"
+
+
+# ---- Mount ----------------------------------------------------------------
+
+
+def test_mount_resolves_frames_from_plugins():
+    from ros_sugar.robot import Mount
+
+    robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="lite3")
+    robot.base_frame = "base_link"
+    cam = MockSensor(cam_name="HikVision", id="front_cam")
+
+    mount = Mount(parent=robot, xyz=(0.15, 0.0, 0.35))
+    mount.child = cam
+    assert mount.parent_frame == "base_link"
+    assert mount.child_frame == "front_cam_frame"
+
+
+def test_mount_accepts_a_plain_frame_for_a_fixed_sensor():
+    """A sensor watching a room is mounted on the world, not on the robot."""
+    from ros_sugar.robot import Mount
+
+    cam = MockSensor(cam_name="Lobby", id="lobby_cam")
+    mount = Mount(parent="map", xyz=(2.0, 3.0, 2.5))
+    mount.child = cam
+    assert mount.parent_frame == "map"
+
+
+def test_mount_rejects_something_with_no_frame():
+    from ros_sugar.robot import Mount
+
+    with pytest.raises(ValueError, match="Cannot mount against"):
+        Mount(parent=object()).parent_frame
+
+
+def test_euler_to_quaternion_matches_known_rotations():
+    from ros_sugar.robot.mount import quaternion_from_euler
+
+    x, y, z, w = quaternion_from_euler(0.0, 0.0, 0.0)
+    assert (x, y, z, w) == (0.0, 0.0, 0.0, 1.0)
+
+    # 90 degrees about Z
+    x, y, z, w = quaternion_from_euler(0.0, 0.0, 3.141592653589793 / 2)
+    assert abs(z - 0.7071067811865476) < 1e-9
+    assert abs(w - 0.7071067811865476) < 1e-9
+
+
+def test_a_pose_in_another_mounts_frame():
+    """Sensors are mounted on the body, but what reads one of them often wants
+    another in its own frame -- a LiDAR-inertial mapper wants the IMU in the
+    LiDAR's."""
+    import math
+
+    from ros_sugar.robot.mount import pose_relative_to
+
+    origin = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+
+    # In its own frame, a pose is the origin
+    xyz, rpy = pose_relative_to(origin, origin)
+    assert xyz == pytest.approx((0.0, 0.0, 0.0))
+    assert rpy == pytest.approx((0.0, 0.0, 0.0))
+
+    # From a frame a metre ahead, the parent's origin is a metre behind
+    xyz, rpy = pose_relative_to(origin, ((1.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+    assert xyz == pytest.approx((-1.0, 0.0, 0.0))
+    assert rpy == pytest.approx((0.0, 0.0, 0.0))
+
+    # A frame turned a quarter turn about Z: what lies ahead of the parent is
+    # off to that frame's right, and its own heading is turned back
+    xyz, rpy = pose_relative_to(
+        ((1.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, math.pi / 2)),
+    )
+    assert xyz == pytest.approx((0.0, -1.0, 0.0))
+    assert rpy == pytest.approx((0.0, 0.0, -math.pi / 2))
+
+
+def test_a_relative_pose_is_the_transform_composed():
+    """Placing the result back through the frame lands where the pose was, for
+    a translation and a rotation neither of which is an easy case."""
+    import numpy as np
+
+    from ros_sugar.robot.mount import _rotation_from_euler, pose_relative_to
+
+    pose = ((0.31, -0.12, 0.08), (0.2, -0.4, 1.1))
+    frame = ((0.12, 0.03, 0.22), (-0.1, 0.5, -0.7))
+
+    xyz, rpy = pose_relative_to(pose, frame)
+
+    rotation = _rotation_from_euler(*frame[1])
+    assert rotation @ np.array(xyz) + np.array(frame[0]) == pytest.approx(pose[0])
+    assert rotation @ _rotation_from_euler(*rpy) == pytest.approx(
+        _rotation_from_euler(*pose[1])
+    )
+
+
+def test_launcher_collects_mounts_from_add_plugin(rclpy_context):
+    from ros_sugar.robot import Mount
+
+    robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="lite3")
+    robot.base_frame = "base_link"
+    cam = MockSensor(cam_name="HikVision", id="front_cam")
+
+    launcher = _launcher_with([])
+    launcher.add_plugin(robot)
+    launcher.add_plugin(cam, mount=Mount(parent=robot, xyz=(0.15, 0.0, 0.35)))
+
+    assert len(launcher._mounts) == 1
+    mount = launcher._mounts[0]
+    assert mount.parent_frame == "base_link"
+    # the child is filled in from the plugin, so a recipe never repeats it
+    assert mount.child_frame == "front_cam_frame"
+
+
+class _StaticTransforms:
+    """Receives what the launcher publishes to /tf_static."""
+
+    def __init__(self):
+        self.transforms = []
+
+    def set_static_transforms(self, transforms):
+        self.transforms = transforms
+
+
+def test_the_launcher_places_the_base_frame_on_its_footprint(rclpy_context):
+    """The geometry is centred on the base frame, so the footprint is half the
+    robot's height below it: what Kompass's collision checking assumes, made
+    visible on TF for everything else."""
+    import numpy as np
+
+    from ros_sugar.config import RobotConfig, RobotGeometryType, RobotType
+    from ros_sugar.config.robot import AngularCtrlLimits, LinearCtrlLimits
+
+    robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="lite3")
+    robot.base_frame = "body"
+    robot.robot_config = RobotConfig(
+        model_type=RobotType.DIFFERENTIAL_DRIVE,
+        geometry_type=RobotGeometryType.BOX,
+        geometry_params=np.array([0.61, 0.37, 0.4]),
+        ctrl_vx_limits=LinearCtrlLimits(max_vel=1.0, max_acc=2.5, max_decel=7.5),
+        ctrl_omega_limits=AngularCtrlLimits(max_omega=1.5, max_acc=2.5, max_decel=4.0, max_ang=1.57),
+    )
+    assert robot.base_height == 0.2
+
+    launcher = _launcher_with([])
+    launcher.add_plugin(robot)
+    launcher.monitor_node = _StaticTransforms()
+    launcher._publish_mounts()
+
+    (footprint,) = launcher.monitor_node.transforms
+    assert (footprint.header.frame_id, footprint.child_frame_id) == ("base_footprint", "body")
+    assert footprint.transform.translation.z == 0.2
+    assert footprint.transform.rotation.w == 1.0
+
+
+def test_a_robot_without_a_geometry_gets_no_footprint(rclpy_context):
+    robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="lite3")
+    robot.base_frame = "body"
+    assert robot.base_height is None
+    launcher = _launcher_with([])
+    launcher.add_plugin(robot)
+    launcher.monitor_node = _StaticTransforms()
+    launcher._publish_mounts()
+    assert launcher.monitor_node.transforms == []
+
+
+def test_a_sensor_needs_no_mount_when_tf_already_has_its_frame(rclpy_context):
+    """Mode B: a URDF or the sensor's own driver already publishes the frame,
+    so the recipe declares nothing and Sugarcoat just consumes it."""
+    cam = MockSensor(cam_name="HikVision", id="front_cam")
+    launcher = _launcher_with([])
+    launcher.add_plugin(cam)
+
+    assert launcher._mounts == []
+
+
+# ---------------------------------------------------------------------------
+# launcher-side plugin bring-up
+# ---------------------------------------------------------------------------
+
+
+class _StubMonitor:
+    """Stands in for the Monitor node in ``_setup_plugins``.
+
+    Only the two methods the launcher wires plugin feedback through are
+    needed; building a real Monitor would drag in the whole launch machinery.
+    """
+
+    def __init__(self):
+        self.registered = []
+
+    def register_external_topic(self, topic):
+        self.registered.append(topic.name)
+
+    def feed_external_topic(self, name, msg):
+        pass
+
+
+def test_setup_plugins_hosts_every_plugin_on_one_bus(rclpy_context):
+    """Each plugin needs its own host -- otherwise a sensor plugin's transports
+    are never opened and it is attached in name only."""
+    launcher = _launcher_with([])
+    launcher.monitor_node = _StubMonitor()
+
+    robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="lite3")
+    camera = MockUdpSensor(state_port=_free_port(), id="front_cam")
+    launcher.add_plugin(robot)
+    launcher.add_plugin(camera)
+
+    try:
+        launcher._setup_plugins()
+
+        assert len(launcher._plugin_hosts) == 2
+        assert all(host._active for host in launcher._plugin_hosts)
+        # one bus, owned by the launcher rather than by any host
+        assert launcher._plugin_bus is not None
+        assert all(not host._owns_bus for host in launcher._plugin_hosts)
+        assert all(
+            host.bus is launcher._plugin_bus for host in launcher._plugin_hosts
+        )
+    finally:
+        for host in launcher._plugin_hosts:
+            host.close()
+        if launcher._plugin_bus:
+            launcher._plugin_bus.close()
+
+
+def test_setup_plugins_creates_and_injects_shm_manager(rclpy_context):
+    """On the socket bus the launcher creates one shared-memory writer pool and
+    injects it into every host; the in-process bus needs none."""
+    from ros_sugar.robot.shm import PluginShmManager
+
+    # Socket bus (multiprocess): a non-empty _pkg_executable forces it.
+    launcher = _launcher_with([])
+    launcher.monitor_node = _StubMonitor()
+    launcher._pkg_executable = {"c": ("pkg", "entry")}
+    launcher.add_plugin(MockUdpSensor(state_port=_free_port(), id="cam"))
+    try:
+        launcher._setup_plugins()
+        assert isinstance(launcher._plugin_shm, PluginShmManager)
+        assert launcher._plugin_hosts
+        assert all(h._shm is launcher._plugin_shm for h in launcher._plugin_hosts)
+    finally:
+        for host in launcher._plugin_hosts:
+            host.close()
+        if launcher._plugin_bus:
+            launcher._plugin_bus.close()
+        if launcher._plugin_shm:
+            launcher._plugin_shm.close()
+
+    # In-process bus: no manager, and hosts get shm=None.
+    launcher2 = _launcher_with([])
+    launcher2.monitor_node = _StubMonitor()
+    launcher2.add_plugin(MockUdpSensor(state_port=_free_port(), id="cam2"))
+    try:
+        launcher2._setup_plugins()
+        assert launcher2._plugin_shm is None
+        assert all(h._shm is None for h in launcher2._plugin_hosts)
+    finally:
+        for host in launcher2._plugin_hosts:
+            host.close()
+        if launcher2._plugin_bus:
+            launcher2._plugin_bus.close()
+
+
+def test_setup_plugins_registers_each_plugins_feedback_with_the_monitor(rclpy_context):
+    """Events over non-ROS feedback are tracked without a ROS subscription, so
+    every plugin's channels have to reach the Monitor -- namespaced, or two
+    plugins would register the same topic."""
+    launcher = _launcher_with([])
+    launcher.monitor_node = _StubMonitor()
+
+    launcher.add_plugin(
+        MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="lite3")
+    )
+    launcher.add_plugin(MockUdpSensor(state_port=_free_port(), id="front_cam"))
+
+    try:
+        launcher._setup_plugins()
+        assert set(launcher.monitor_node.registered) == {
+            "plugin/lite3/feedback/Int32",
+            "plugin/front_cam/feedback/Int32",
+        }
+    finally:
+        for host in launcher._plugin_hosts:
+            host.close()
+        if launcher._plugin_bus:
+            launcher._plugin_bus.close()
+
+
+def test_setup_plugins_is_a_noop_without_plugins(rclpy_context):
+    launcher = _launcher_with([])
+    launcher.monitor_node = _StubMonitor()
+
+    launcher._setup_plugins()
+
+    assert launcher._plugin_hosts == []
+    assert launcher._plugin_bus is None
+
+
+def test_mounts_are_published_as_static_transforms(rclpy_context):
+    """The mount only matters if it actually reaches the TF tree."""
+    import math
+
+    from rclpy.node import Node
+    from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile
+    from tf2_msgs.msg import TFMessage
+
+    from ros_sugar.robot import Mount
+
+    publisher_node = Node("mount_publisher")
+    listener_node = Node("mount_listener")
+    received = []
+    listener_node.create_subscription(
+        TFMessage,
+        "/tf_static",
+        lambda m: received.extend(m.transforms),
+        QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        ),
+    )
+
+    launcher = _launcher_with([])
+    # The real Monitor is not rclpy-initialized when mounts are registered, so
+    # it only holds them; a live node stands in for the broadcast half here.
+    launcher.monitor_node = publisher_node
+    publisher_node.set_static_transforms = lambda t: setattr(
+        publisher_node, "_pending", t
+    )
+
+    robot = MockPlugin(state_port=_free_port(), cmd_port=_free_port(), id="lite3")
+    robot.base_frame = "base_link"
+    camera = MockSensor(cam_name="HikVision", id="front_cam")
+    launcher.add_plugin(robot)
+    launcher.add_plugin(
+        camera,
+        mount=Mount(parent=robot, xyz=(0.15, 0.0, 0.35), rpy=(0.0, 0.0, math.pi / 2)),
+    )
+
+    try:
+        launcher._publish_mounts()
+
+        # what Monitor.activate() does once the node is up
+        from tf2_ros import StaticTransformBroadcaster
+
+        stamp = publisher_node.get_clock().now().to_msg()
+        for transform in publisher_node._pending:
+            transform.header.stamp = stamp
+        broadcaster = StaticTransformBroadcaster(publisher_node)
+        broadcaster.sendTransform(publisher_node._pending)
+
+        deadline = time.time() + 3.0
+        while not received and time.time() < deadline:
+            rclpy.spin_once(publisher_node, timeout_sec=0.05)
+            rclpy.spin_once(listener_node, timeout_sec=0.05)
+
+        assert received, "the mount never reached /tf_static"
+        transform = received[0]
+        assert transform.header.frame_id == "base_link"
+        assert transform.child_frame_id == "front_cam_frame"
+        assert abs(transform.transform.translation.x - 0.15) < 1e-6
+        assert abs(transform.transform.translation.z - 0.35) < 1e-6
+        # 90 degrees about Z
+        assert abs(transform.transform.rotation.z - 0.7071067811865476) < 1e-6
+        assert abs(transform.transform.rotation.w - 0.7071067811865476) < 1e-6
+    finally:
+        publisher_node.destroy_node()
+        listener_node.destroy_node()
+
+
+def test_publishing_mounts_is_a_noop_without_any(rclpy_context):
+    from rclpy.node import Node
+
+    node = Node("no_mounts")
+    launcher = _launcher_with([])
+    launcher.monitor_node = node
+    node.set_static_transforms = lambda t: setattr(node, "_pending", t)
+    try:
+        launcher._publish_mounts()  # must not register anything or raise
+        assert not hasattr(node, "_pending")
+    finally:
+        node.destroy_node()
+
+
+# ---------------------------------------------------------------------------
+# Shared-memory feedback encode/decode (socket-bus fast path)
+# ---------------------------------------------------------------------------
+
+
+def _image_sensor():
+    """A minimal sensor plugin exposing one built-in Image feedback."""
+    from ros_sugar.supported_types import Image
+
+    class _ImageSensor(SensorPlugin):
+        def __init__(self):
+            self.metadata = PluginMetadata(name="ImageSensor")
+            transport = SdkCallbackTransport("img")
+            self.transports = {"img": transport}
+            self.feedbacks = {
+                "Image": Feedback(
+                    key="Image",
+                    msg_type=Image,
+                    transport=transport,
+                    decoder=lambda raw: raw,
+                )
+            }
+
+    return _ImageSensor()
+
+
+def _image_msg(nbytes: int):
+    from sensor_msgs.msg import Image as ROSImage
+
+    msg = ROSImage()
+    msg.header.frame_id = "cam"
+    msg.height = 1
+    msg.width = nbytes
+    msg.encoding = "mono8"
+    msg.step = nbytes
+    msg.data = bytes((i % 256) for i in range(nbytes))
+    return msg
+
+
+def test_encode_feedback_shm_roundtrip_skips_cdr(monkeypatch):
+    """A large hook-supporting feedback rides shared memory: the payload is
+    tagged SHM, rebuilds byte-identically, and no CDR (de)serialization runs."""
+    import ros_sugar.robot.plugin as plugin_mod
+    from ros_sugar.robot.shm import PluginShmManager, ShmReaderCache
+
+    counts = {"ser": 0, "deser": 0}
+    _ser, _deser = plugin_mod.serialize_message, plugin_mod.deserialize_message
+    monkeypatch.setattr(
+        plugin_mod,
+        "serialize_message",
+        lambda m: (counts.__setitem__("ser", counts["ser"] + 1), _ser(m))[1],
+    )
+    monkeypatch.setattr(
+        plugin_mod,
+        "deserialize_message",
+        lambda d, t: (counts.__setitem__("deser", counts["deser"] + 1), _deser(d, t))[1],
+    )
+
+    sensor = _image_sensor()
+    fb = sensor.feedbacks["Image"]
+    manager = PluginShmManager(launcher_pid=4321)
+    host = RobotPluginHost(sensor, node=None, bus=InProcessFeedbackBus(), shm=manager)
+    try:
+        big = _image_msg(40_000)  # >= SHM_MIN_BYTES
+        payload = host._encode_feedback(fb, big)
+        assert payload[:1] == plugin_mod._FB_KIND_SHM
+
+        reader = ShmReaderCache()
+        out = plugin_mod._decode_shm_feedback(fb, reader, payload[1:])
+        reader.close()
+
+        assert bytes(out.data) == bytes(big.data)
+        assert out.encoding == "mono8"
+        assert out.header.frame_id == "cam"
+        assert counts == {"ser": 0, "deser": 0}  # SHM path pays no CDR
+    finally:
+        manager.close()
+
+
+def test_encode_feedback_falls_back_to_cdr():
+    """No manager, or a sub-threshold frame, takes the CDR path (tagged CDR)."""
+    import ros_sugar.robot.plugin as plugin_mod
+    from rclpy.serialization import deserialize_message
+    from sensor_msgs.msg import Image as ROSImage
+
+    from ros_sugar.robot.shm import PluginShmManager
+
+    sensor = _image_sensor()
+    fb = sensor.feedbacks["Image"]
+
+    # No manager -> always CDR, even for a large frame.
+    host_no_shm = RobotPluginHost(sensor, node=None, bus=InProcessFeedbackBus())
+    assert host_no_shm._encode_feedback(fb, _image_msg(40_000))[:1] == (
+        plugin_mod._FB_KIND_CDR
+    )
+
+    # Manager present but a sub-threshold frame -> CDR (size gate), and it
+    # deserializes cleanly once the tag byte is stripped.
+    manager = PluginShmManager(launcher_pid=99)
+    host = RobotPluginHost(sensor, node=None, bus=InProcessFeedbackBus(), shm=manager)
+    try:
+        payload = host._encode_feedback(fb, _image_msg(100))
+        assert payload[:1] == plugin_mod._FB_KIND_CDR
+        out = deserialize_message(payload[1:], ROSImage)
+        assert out.encoding == "mono8"
+    finally:
+        manager.close()
+
+
+def test_socket_bus_shm_end_to_end(monkeypatch):
+    """A large Image travels host -> component over a real socket bus through
+    shared memory: byte-identical on the far side, and no CDR runs on the
+    payload -- only the tiny descriptor crosses the socket."""
+    import ros_sugar.robot.plugin as plugin_mod
+    from ros_sugar.robot.shm import PluginShmManager
+
+    counts = {"ser": 0, "deser": 0}
+    _ser, _deser = plugin_mod.serialize_message, plugin_mod.deserialize_message
+    monkeypatch.setattr(
+        plugin_mod,
+        "serialize_message",
+        lambda m: (counts.__setitem__("ser", counts["ser"] + 1), _ser(m))[1],
+    )
+    monkeypatch.setattr(
+        plugin_mod,
+        "deserialize_message",
+        lambda d, t: (counts.__setitem__("deser", counts["deser"] + 1), _deser(d, t))[1],
+    )
+
+    # HOST: server socket bus + shm manager
+    server = SocketFeedbackBus()
+    manager = PluginShmManager()
+    host_plugin = _image_sensor()
+    host_plugin._set_id("cam")
+    host_plugin._bind_identity()
+    host = RobotPluginHost(host_plugin, node=None, bus=server, owns_bus=True, shm=manager)
+    host.open()
+
+    # CONSUMER: a second plugin on a client socket bus, as a component process is
+    consumer = _image_sensor()
+    consumer._set_id("cam")
+    consumer._bind_identity()
+    client = SocketFeedbackBus(server.endpoint)
+    client.connect()
+    consumer.set_bus(client)
+
+    received = []
+    handle = consumer.subscribe_feedback(consumer.feedbacks["Image"], received.append)
+    try:
+        time.sleep(0.2)  # let the SUBSCRIBE reach the server before we publish
+        frame = _image_msg(40_000)
+        host._dispatch_feedback(host_plugin.feedbacks["Image"], frame)
+
+        deadline = time.time() + 3.0
+        while not received and time.time() < deadline:
+            time.sleep(0.02)
+        assert received, "no feedback arrived over the socket bus"
+        out = received[0]
+        assert bytes(out.data) == bytes(frame.data)
+        assert out.encoding == "mono8"
+        assert counts == {"ser": 0, "deser": 0}  # traveled via SHM, not CDR
+    finally:
+        handle.unsubscribe()
+        host.close()  # owns_bus=True -> closes the server bus
+        client.close()
+        manager.close()
+
+
+def test_shm_descriptor_is_tiny_on_the_wire():
+    """A full 1080p frame encodes to a small descriptor: the socket carries
+    ~100 bytes, not the ~6 MB frame."""
+    import ros_sugar.robot.plugin as plugin_mod
+    from ros_sugar.robot.shm import PluginShmManager
+    from sensor_msgs.msg import Image as ROSImage
+
+    manager = PluginShmManager()
+    sensor = _image_sensor()
+    host = RobotPluginHost(sensor, node=None, bus=InProcessFeedbackBus(), shm=manager)
+    fb = sensor.feedbacks["Image"]
+    try:
+        frame = ROSImage()
+        frame.height, frame.width = 1080, 1920
+        frame.encoding = "rgb8"
+        frame.step = 1920 * 3
+        frame.data = os.urandom(1920 * 1080 * 3)  # ~6.2 MB 1080p RGB
+        assert len(frame.data) > 6_000_000
+
+        payload = host._encode_feedback(fb, frame)
+        assert payload[:1] == plugin_mod._FB_KIND_SHM
+        assert len(payload) < 1024  # a descriptor crossed the wire, not the frame
+    finally:
+        manager.close()
+
+
+class _RosCloudPlugin(RobotPlugin):
+    """A plugin serving one sensor over a ROS topic of its own, the way a
+    LiDAR driver started by the plugin publishes."""
+
+    def __init__(self):
+        from ros_sugar.robot import RosTopicTransport
+
+        self.metadata = PluginMetadata(name="RosCloudBot", vendor="test")
+        transport = RosTopicTransport(
+            "lidar_front",
+            topic_name="rs/front/points",
+            msg_type=LaserScan,
+            qos=QoSConfig(reliability=qos.ReliabilityPolicy.BEST_EFFORT),
+        )
+        self.transports = {"lidar_front": transport}
+        self.feedbacks = {
+            "lidar_front": Feedback(
+                key="lidar_front", msg_type=LaserScan, transport=transport
+            )
+        }
+
+
+def test_ros_topic_feedback_keeps_the_recipe_name(rclpy_context):
+    """A plugin serving an input over a ROS topic changes where the input is
+    subscribed, not what it is called. The callbacks key, ``in_topics`` and
+    any name a component recorded stay the recipe's; the subscriber alone
+    sits on the plugin's topic with the plugin's QoS, and a message published
+    there lands in the recipe's slot."""
+    from sensor_msgs.msg import LaserScan as RosLaserScan
+
+    from ros_sugar.core.component import BaseComponent
+
+    component = BaseComponent(
+        component_name="ros_feedback_component",
+        inputs=[Topic(name="lidar_front", msg_type="LaserScan", use_plugin=True)],
+    )
+    component.rclpy_init_node()
+    component._robot_plugin = _RosCloudPlugin()
+    try:
+        component._use_robot_plugin()
+        assert list(component.callbacks) == ["lidar_front"]
+        assert component.in_topics[0].name == "lidar_front"
+        # a ROS subscription, not the plugin bus
+        assert "lidar_front" not in component._external_topics
+
+        component.create_all_subscribers()
+        subscriber = component.callbacks["lidar_front"]._subscriber
+        assert subscriber.topic_name == "/rs/front/points"
+        assert (
+            subscriber.qos_profile.reliability == qos.ReliabilityPolicy.BEST_EFFORT
+        )
+
+        publisher = component.create_publisher(RosLaserScan, "rs/front/points", 10)
+        scan = RosLaserScan()
+        scan.header.frame_id = "rslidar_front"
+        callback = component.callbacks["lidar_front"]
+        deadline = time.time() + 2.0
+        while callback.msg is None and time.time() < deadline:
+            publisher.publish(scan)
+            rclpy.spin_once(component, timeout_sec=0.05)
+        assert callback.msg is not None
+        assert callback.frame_id == "rslidar_front"
+
+        # the explicit swap is the one thing that changes identity
+        assert component._replace_input_topic("lidar_front", "/other", "LaserScan") is None
+        assert list(component.callbacks) == ["other"]
+        assert component.callbacks["other"]._subscriber.topic_name == "/other"
+    finally:
+        component.destroy_node()
+
+
+def test_robot_plugin_sensor_mounts_are_collected_by_the_launcher():
+    """A robot plugin places its own built-in sensors through ``mounts``;
+    the launcher publishes them like a sensor plugin's mount."""
+    from ros_sugar import Launcher
+    from ros_sugar.robot import Mount
+
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    plugin.base_frame = "base"
+    plugin.mounts = [Mount(parent=plugin, child="sonar_front", xyz=(0.3, 0.0, 0.0))]
+    launcher = Launcher(robot_plugin=plugin)
+    assert [(m.parent_frame, m.child_frame) for m in launcher._mounts] == [
+        ("base", "sonar_front")
+    ]
+
+    # A mount that names no frame cannot be placed
+    plugin = MockPlugin(state_port=_free_port(), cmd_port=_free_port())
+    plugin.base_frame = "base"
+    plugin.mounts = [Mount(parent=plugin, xyz=(0.3, 0.0, 0.0))]
+    with pytest.raises(ValueError, match="child"):
+        Launcher(robot_plugin=plugin)
+
+
+def _make_map_store(tmp_path, active_name, files):
+    """A map store with one map, marked active by a symlink."""
+    store = tmp_path / "maps"
+    mapdir = store / active_name
+    mapdir.mkdir(parents=True)
+    for f in files:
+        (mapdir / f).write_text("image: x\n")
+    (store / "active").symlink_to(mapdir)
+    return str(store)
+
+
+def test_active_grid_path_prefers_the_declared_name(tmp_path):
+    store = _make_map_store(tmp_path, "map-20260101-100000",
+                            ["occ_grid.yaml", "full_cloud.pcd"])
+    decl = VendorMapping(start=["x"], stop=["y"], store=store)
+    assert decl.active_grid_path().endswith("occ_grid.yaml")
+
+
+def test_active_grid_path_discovers_an_unconventional_name(tmp_path):
+    """A map imported rather than built by the vendor's own tool can use any
+    filename -- assuming occ_grid.yaml is what breaks a recipe."""
+    store = _make_map_store(tmp_path, "map-20260807-153443", ["office.yaml"])
+    decl = VendorMapping(start=["x"], stop=["y"], store=store)
+    assert decl.active_grid_path().endswith("office.yaml")
+
+
+def test_active_grid_path_refuses_to_guess(tmp_path):
+    """Two candidates and no declared name: returning either would be a coin
+    flip a recipe would silently navigate on."""
+    store = _make_map_store(tmp_path, "m-20260101-100000", ["a.yaml", "b.yaml"])
+    decl = VendorMapping(start=["x"], stop=["y"], store=store, grid="")
+    assert decl.active_grid_path() is None
+
+
+def test_active_grid_path_without_a_store_or_active_map(tmp_path):
+    assert VendorMapping(start=["x"], stop=["y"], store="").active_grid_path() is None
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    decl = VendorMapping(start=["x"], stop=["y"], store=str(empty))
+    assert decl.active_grid_path() is None
+
+
+def test_native_mapping_answers_the_same_question(tmp_path):
+    """A recipe should not have to know which provider it is talking to."""
+    store = _make_map_store(tmp_path, "room-20260101-100000", ["occ_grid.yaml"])
+    decl = NativeMapping(cloud="lidar", store=store)
+    assert decl.active_grid_path().endswith("occ_grid.yaml")

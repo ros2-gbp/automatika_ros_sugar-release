@@ -1,65 +1,85 @@
 """Base Component"""
 
-import os
-import time
-import json
-import yaml
-import toml
-import socket
-from abc import abstractmethod
-from copy import deepcopy
-from contextlib import contextmanager
-import threading
-from typing import Any, Dict, List, Optional, Union, Callable, Sequence, Tuple, Type
-from functools import wraps, partial
 import importlib
+import inspect
+import json
+import threading
+import time
+from contextlib import contextmanager
+from copy import deepcopy
+from functools import partial, wraps
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
-from rclpy import logging as rclpy_logging
-from rclpy.action.server import ActionServer, CancelResponse, GoalResponse
-from rclpy.utilities import try_shutdown
 import rclpy.callback_groups as ros_callback_groups
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from rclpy import lifecycle
-from rclpy.lifecycle.node import TransitionCallbackReturn, LifecycleState
-from rclpy.publisher import Publisher as ROSPublisher
-from rclpy.subscription import Subscription
-from rclpy.client import Client
-from tf2_ros.transform_listener import TransformListener
-from builtin_interfaces.msg import Time
-from lifecycle_msgs.msg import State as LifecycleStateMsg
-
+from action_msgs.srv import CancelGoal
 from automatika_ros_sugar.srv import (
     ChangeParameter,
     ChangeParameters,
     ConfigureFromFile,
-    ReplaceTopic,
     ExecuteMethod,
+    ReplaceTopic,
 )
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import TransformStamped
+from lifecycle_msgs.msg import State as LifecycleStateMsg
+from rclpy import lifecycle
+from rclpy import logging as rclpy_logging
+from rclpy.action.server import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.client import Client
+from rclpy.lifecycle.node import LifecycleState, TransitionCallbackReturn
+from rclpy.publisher import Publisher as ROSPublisher
+from rclpy.subscription import Subscription
+from rclpy.utilities import try_shutdown
+from std_srvs.srv import Trigger
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 
+from ..base_clients import ActionClientConfig
 from .action import Action
 from .event import Event, EventBlackboardEntry
+from .action import bind_monitored_actions
 from ..io.callbacks import GenericCallback
+from ..io.ipc import ExternalProcessorClient, processor_id
+from ..config.base_attrs import explicit_fields
 from ..config.base_config import (
+    BaseAttrs,
     BaseComponentConfig,
     ComponentRunType,
     ExternalProcessorType,
-    BaseAttrs,
     QoSConfig,
 )
-from ..io.topic import Topic
-from ..io.supported_types import SupportedType
 from ..io.publisher import Publisher
-from .fallbacks import ComponentFallbacks, Fallback
-from .status import Status
+from ..io.supported_types import (
+    SupportedType,
+    add_additional_datatypes,
+    from_jsonable,
+)
+from ..io.topic import Topic
+from ..tf import TFListener, TFListenerConfig
 from ..utils import (
+    ActionReturnType,
     camel_to_snake_case,
-    component_fallback,
     component_action,
+    component_fallback,
+    destroy_action_entities,
     get_methods_with_decorator,
     log_srv,
+    parse_action_result,
 )
-from ..base_clients import ActionClientConfig
-from ..tf import TFListener, TFListenerConfig
+from .fallbacks import ComponentFallbacks, Fallback
+from .status import Status
 
 
 class BaseComponent(lifecycle.Node):
@@ -136,11 +156,18 @@ class BaseComponent(lifecycle.Node):
 
         self.__fallbacks = fallbacks or ComponentFallbacks()
         self.__fallbacks_giveup: bool = False
+        # Names the ExecuteMethod service may call, found on first use
+        self.__remote_methods: Optional[Set[str]] = None
         self.__fallbacks_listeners: List[Subscription] = []
         # Blackboard to store latest messages for all topics required for all fallbacks
         # {'topic_1_name': RosMsg, 'topic_2_name': ROSMsg, ... }
         self._fallbacks_topics_blackboard: Dict[str, EventBlackboardEntry] = {}
         self._fallbacks_topics_timeout: Dict[str, float] = {}
+
+        # Created on activation, but declared here so that tearing the component
+        # down is safe whatever state it reached
+        self._default_services: List = []
+        self.health_status_publisher: Optional[ROSPublisher] = None
 
         if self.config._use_without_launcher:
             # Create default services for changing config/inputs/outputs during runtime
@@ -149,8 +176,13 @@ class BaseComponent(lifecycle.Node):
         self.action_type = main_action_type
         self.service_type = main_srv_type
         self._external_processors: Dict[
-            str, Tuple[List[Union[Callable, socket.socket]], ExternalProcessorType]
+            str,
+            Tuple[
+                List[Union[Callable, ExternalProcessorClient]], ExternalProcessorType
+            ],
         ] = {}
+        # Socket of the launcher's external processor server, set by the launcher
+        self._external_processors_endpoint: Optional[str] = None
 
         self.__events: Optional[List[Event]] = None
         self.__actions: Optional[List[List[Action]]] = None
@@ -170,19 +202,42 @@ class BaseComponent(lifecycle.Node):
         # TODO: add config parameter (one goal vs goal queue)
         self._main_goal_handle = None
         self._main_goal_lock = threading.Lock()
+        # Guards the event blackboard and the per topic event index, which a
+        # A monitored Action can extend at runtime from a worker thread when it
+        # starts watching its success condition
+        self._events_lock = threading.Lock()
         self._main_action_name: Optional[str] = None
         self._main_srv_name: Optional[str] = None
 
         # Additional types from derived packages
         self._additional_types: List[Type[SupportedType]] = []
 
-        # Robot plugin (set by the Launcher; a HOST instance in multithreaded
-        # launch or a reconstructed CLIENT instance in multiprocess launch)
-        self._robot_plugin = None
+        # Command prefix for this component's process in multiprocess launch,
+        # e.g. "taskset -c 4-7", "nice -n 10" or "perf record".
+        self.launch_prefix: Optional[str] = None
+
+        # Plugins attached by the Launcher, keyed by plugin id (HOST instances
+        # in multithreaded launch, reconstructed CLIENT instances in
+        # multiprocess launch)
+        self._plugins: Dict[str, Any] = {}
         # Names of input/output topics bound to non-ROS robot plugin transports
         self._external_topics: set = set()
+        # Recipe topic name -> ROS topic its subscriber is created on, for
+        # inputs a robot plugin serves over a ROS topic of its own
+        self._plugin_ros_topics: Dict[str, str] = {}
         # Feedback-bus subscription handles to release on deactivation
         self._robot_plugin_bus_handles: List = []
+
+        # TF lookup: one buffer (and so one /tf + /tf_static subscription) per
+        # node, shared by every frame pair the component looks up
+        self._tf_buffer: Optional[Buffer] = None
+        self._tf_transform_listener: Optional[TransformListener] = None
+        self._tf_listeners: Dict[Tuple[str, str], TFListener] = {}
+        # Input topic name -> (goal frame, is the mount rigid). Declared by the
+        # component (usually in init_variables)
+        self._input_frame_targets: Dict[str, Tuple[str, bool]] = {}
+        # Keys already reported through log_once
+        self._logged_once: Set[str] = set()
 
         # To use without launcher -> Init the ROS2 node directly
         if self.config._use_without_launcher:
@@ -213,6 +268,9 @@ class BaseComponent(lifecycle.Node):
 
         return ok()
 
+    # TODO: The two methods below write the selected callback/converter onto the
+    # message type class, which every component in the process shares, so the
+    # first component to select decides for all the others (problem only in threaded launch). Fix this and do not write to the class.
     def _reparse_inputs_callbacks(self, inputs: Sequence[Topic]) -> Sequence[Topic]:
         """Select inputs callbacks. Selects a callback for each input from the same component package if it exists. Otherwise, the first available callback will be assigned. Note: This method is added to enable using components from multiple packages in the same script, where each component prioritizes using callbacks from its own package.
 
@@ -270,29 +328,99 @@ class BaseComponent(lifecycle.Node):
         return outputs
 
     def _warn_orphaned_plugin_topics(self):
-        """Emit a warning for any ``use_plugin`` flagged topic when no robot
-        plugin is attached."""
+        """Emit a warning for any ``use_plugin`` topic with no plugin to serve it.
+
+        A recipe cannot reach here: `Launcher._validate_plugin_references`
+        raises at bringup, where both the components and the plugins are known.
+        This covers a component run on its own, which is already up by the time
+        it finds out and can only carry on as plain ROS.
+        """
         in_topics = [cb.input_topic for cb in self.callbacks.values()]
         out_topics = [pub.output_topic for pub in self.publishers_dict.values()]
         orphaned = [t.name for t in in_topics + out_topics if t.use_plugin]
         if orphaned:
             self.get_logger().warning(
                 f"Component '{self.node_name}' has {len(orphaned)} topic(s) "
-                f"flagged use_plugin=True but no robot plugin "
-                f"is attached to the launcher: {orphaned}. Those topics will "
-                "behave as ordinary ROS topics."
+                f"asking for a plugin, but none is attached: {orphaned}. "
+                "Those topics will behave as ordinary ROS topics."
             )
+
+    @property
+    def _robot_plugin(self) -> Optional[Any]:
+        """Convenience method to get attached plugin that describes the robot,
+        if any. A recipe has at most one.
+        """
+        from ..robot.plugin import PluginRole
+
+        for plugin in self._plugins.values():
+            if plugin.role is PluginRole.ROBOT:
+                return plugin
+        return None
+
+    @_robot_plugin.setter
+    def _robot_plugin(self, plugin: Optional[Any]) -> None:
+        """Attach (or clear) the robot plugin, leaving other plugins alone."""
+        from ..robot.plugin import PluginRole
+
+        for key, attached in list(self._plugins.items()):
+            if attached.role is PluginRole.ROBOT:
+                del self._plugins[key]
+        if plugin is not None:
+            self.add_plugin(plugin)
+
+    def add_plugin(self, plugin: Any) -> None:
+        """Attach a plugin to this component.
+
+        :param plugin: The plugin instance to attach
+        :type plugin: Plugin
+        """
+        # `id` falls back to a slug of the plugin's name, so it is addressable
+        # whether or not the recipe named it
+        self._plugins[plugin.id] = plugin
+
+    def _plugin_for_topic(self, topic) -> Optional[Any]:
+        """Resolve which attached plugin serves a topic.
+
+        ``use_plugin=True`` means the robot plugin, one per recipe.
+        A string names a plugin by its id.
+
+        :param topic: The topic to resolve
+        :type topic: Topic
+
+        :return: The plugin serving this topic, or None if it is not
+            plugin-backed or the named plugin is not attached
+        :rtype: Optional[Plugin]
+        """
+        if not topic.use_plugin:
+            return None
+        if topic.use_plugin is True:
+            plugin = self._robot_plugin
+            if plugin is None:
+                self.get_logger().error(
+                    f"Topic '{topic.name}' asks for the robot plugin but none is "
+                    "attached. Falling back to an ordinary ROS topic."
+                )
+            return plugin
+        plugin = self._plugins.get(topic.use_plugin)
+        if plugin is None:
+            self.get_logger().error(
+                f"Topic '{topic.name}' is bound to plugin '{topic.use_plugin}', "
+                f"which is not attached to this component. Attached plugins: "
+                f"{', '.join(self._plugins) or 'none'}. Falling back to an "
+                "ordinary ROS topic."
+            )
+        return plugin
 
     def _use_robot_plugin(self):
         """Adapt the component's inputs/outputs to the robot plugin.
 
-        Only topics that opt in with ``use_plugin=True`` are rewired. The
-        plugin entry is resolved by ``topic.name`` first (so a recipe can
-        disambiguate sibling feedbacks of the same type by naming the topic
-        after the plugin's registry key) and falls back to a unique-type
-        match when no key matches. ``use_plugin=False`` (the default) means
-        the topic is internal, never claimed by the plugin even if a
-        matching type exists.
+        Only topics that opt in with ``use_plugin=True`` or
+        ``use_plugin=<plugin.id>`` are rewired. The plugin entry is resolved by
+        ``topic.name`` first (so a recipe can disambiguate sibling feedbacks
+        of the same type by naming the topic after the plugin's registry key) and
+        falls back to a unique-type match when no key matches.
+        ``use_plugin=False`` (the default) means the topic is internal,
+        never claimed by the plugin even if a matching type exists.
 
         ROS-topic transports re-use the native subscriber/publisher swap
         path; non-ROS transports are bound through the feedback bus or the
@@ -301,10 +429,9 @@ class BaseComponent(lifecycle.Node):
         from ..robot.plugin import AmbiguousPluginEntryError
         from ..robot.transports.ros import RosTopicTransport
 
-        plugin = self._robot_plugin
         self.get_logger().info(
-            f"Adapting component '{self.node_name}' to robot plugin "
-            f"'{plugin.metadata.name}'"
+            f"Adapting component '{self.node_name}' to plugins: "
+            f"{', '.join(self._plugins) or 'none'}"
         )
 
         # Handle Robot Feedback (System Input Topics). Snapshot the topics
@@ -313,7 +440,8 @@ class BaseComponent(lifecycle.Node):
         for topic in [cb.input_topic for cb in list(self.callbacks.values())]:
             if topic.name in self._external_topics:
                 continue
-            if not topic.use_plugin:
+            plugin = self._plugin_for_topic(topic)
+            if plugin is None:
                 continue
             try:
                 feedback = plugin.resolve_feedback(topic.name, topic.msg_type.__name__)
@@ -335,31 +463,23 @@ class BaseComponent(lifecycle.Node):
                 continue
             transport = feedback.transport
             if isinstance(transport, RosTopicTransport):
-                if topic.name != transport.topic_name:
-                    self.get_logger().info(
-                        f"Robot plugin remaps input '{topic.name}' "
-                        f"({topic.msg_type.__name__}) to '{transport.topic_name}'"
-                    )
-                error = self._replace_input_topic(
-                    topic.name, transport.topic_name, transport.msg_type
-                )
-                if error:
-                    self.get_logger().error(error)
+                self._bind_ros_feedback(topic, feedback, transport)
             else:
-                self._attach_external_feedback(topic, feedback)
+                self._attach_external_feedback(topic, feedback, plugin)
 
         # Handle Robot Commands (System Output Topics). Snapshot first, as
         # _replace_output_by_transport mutates publishers_dict as we go.
         for topic in [pub.output_topic for pub in list(self.publishers_dict.values())]:
             if topic.name in self._external_topics:
                 continue
-            if not topic.use_plugin:
+            plugin = self._plugin_for_topic(topic)
+            if plugin is None:
                 continue
             try:
                 command = plugin.resolve_command(topic.name, topic.msg_type.__name__)
             except (TypeError, AmbiguousPluginEntryError) as e:
-                # See the feedback loop above: contain a mis-wired topic to
-                # itself, log loudly, fall back to an ordinary ROS publisher.
+                # Contains a mis-wired topic to itself, fall back to an ordinary
+                # ROS publisher.
                 self.get_logger().error(
                     f"Topic '{topic.name}' could not be bound to the robot "
                     f"plugin: {e} Falling back to an ordinary ROS publisher."
@@ -386,9 +506,43 @@ class BaseComponent(lifecycle.Node):
                 if error:
                     self.get_logger().error(error)
             else:
-                self._replace_output_by_transport(topic, command)
+                self._replace_output_by_transport(topic, command, plugin)
 
-    def _attach_external_feedback(self, topic: Topic, feedback) -> None:
+    def _bind_ros_feedback(self, topic: Topic, feedback, transport) -> None:
+        """Serve an input from the ROS topic a robot plugin publishes it on.
+
+        The recipe's topic name stays the input's identity. Only the subscription
+        points at the plugin's topic, with the plugin's message type and QoS,
+        the way `_attach_external_feedback` keeps the name for non-ROS transports.
+
+        :param topic: The component input topic being adapted.
+        :param feedback: The `robot.feedback.Feedback` to bind.
+        :param transport: Its `robot.transports.RosTopicTransport`.
+        """
+        old_callback = self.callbacks.get(topic.name)
+        if old_callback is None:
+            self.get_logger().error(
+                f"Cannot bind robot feedback: no callback slot for input '{topic.name}'"
+            )
+            return
+        new_topic = Topic(
+            name=topic.name,
+            msg_type=transport.msg_type,
+            qos_profile=transport.qos,
+            use_plugin=topic.use_plugin,
+        )
+        new_callback = new_topic.msg_type.callback(new_topic, node_name=self.node_name)
+        # Adaptation runs before the subscribers are created; this is where
+        # the input's subscriber will be pointed
+        self._plugin_ros_topics[topic.name] = transport.topic_name
+        self.callbacks[topic.name] = new_callback
+        self._update_inactive_input_topic(old_callback.input_topic, new_topic)
+        self.get_logger().info(
+            f"Input '{topic.name}' bound to robot plugin feedback "
+            f"'{feedback.key}' via ROS topic '{transport.topic_name}'"
+        )
+
+    def _attach_external_feedback(self, topic: Topic, feedback, plugin) -> None:
         """Bind a non-ROS robot feedback stream into the component's callback slot.
 
         No ROS subscription is created for ``topic``; instead the component
@@ -400,8 +554,7 @@ class BaseComponent(lifecycle.Node):
         component's originally-declared input type (e.g. a manufacturer's custom
         message standing in for ``Odometry``). The component's callback object
         is therefore swapped for one of ``feedback.msg_type``, keeping the
-        original topic name as the ``callbacks`` dict key - exactly as
-        `_replace_input_topic` does for ROS-topic feedback.
+        original topic name as the ``callbacks`` dict key.
 
         :param topic: The component input topic being adapted.
         :param feedback: The `robot.feedback.Feedback` to bind.
@@ -425,7 +578,7 @@ class BaseComponent(lifecycle.Node):
             self.destroy_subscription(old_callback._subscriber)
         self.callbacks[topic.name] = new_callback
         self._update_inactive_input_topic(old_callback.input_topic, new_topic)
-        handle = self._robot_plugin.subscribe_feedback(feedback, new_callback.callback)
+        handle = plugin.subscribe_feedback(feedback, new_callback.callback)
         self._robot_plugin_bus_handles.append(handle)
         self._external_topics.add(topic.name)
         self.get_logger().info(
@@ -433,7 +586,7 @@ class BaseComponent(lifecycle.Node):
             f"'{feedback.key}' via {feedback.transport.kind}"
         )
 
-    def _replace_output_by_transport(self, topic: Topic, command) -> None:
+    def _replace_output_by_transport(self, topic: Topic, command, plugin) -> None:
         """Replace a component output publisher with a robot plugin command adapter.
 
         ``Publisher`` in ``publishers_dict`` is swapped (under the same key) for
@@ -457,10 +610,10 @@ class BaseComponent(lifecycle.Node):
         if isinstance(transport, RosServiceTransport):
             transport.bind_node(self)
         # Prepare the command transport for sending
-        self._robot_plugin.open_command(command)
+        plugin.open_command(command)
 
         adapter = RobotCommandPublisher(
-            self._robot_plugin, command, topic, node_name=self.node_name
+            plugin, command, topic, node_name=self.node_name
         )
         # Preserve the original publisher's pre-processor chain
         if old_publisher is not None:
@@ -498,11 +651,17 @@ class BaseComponent(lifecycle.Node):
         if not isinstance(configs, List):
             configs = [configs]
         for config in configs:
-            # Add new config
-            self._algorithms_config[config.__class__.__name__] = config.asdict()
+            # Only apply fields actually set, not a full snapshot. So fields set
+            # by the component itself are not written over
+            self._algorithms_config[config.__class__.__name__] = explicit_fields(config)
 
     def _configure_algorithm(self, algo_config: BaseAttrs) -> BaseAttrs:
         """Configure an algorithm from the user defined configuration classes
+
+        Applied in increasing order of precedence: whatever the caller passed
+        in, then the configuration set on the component in code, then the
+        configuration file. The file wins, so a deployment can retune an
+        algorithm without editing the code that launched it.
 
         :param algo_config: Algorithm base configuration class
         :type algo_config: BaseAttrs
@@ -510,11 +669,10 @@ class BaseComponent(lifecycle.Node):
         :rtype: BaseAttrs
         """
         algo_config_name = algo_config.__class__.__name__
-        if algo_config_name in self.algorithms_config.keys():
-            config_dict = self.algorithms_config[algo_config_name]
+        if config_dict := self.algorithms_config.get(algo_config_name):
             algo_config.from_dict(config_dict)
-        elif self._config_file:
-            # configure directly from file if available
+        if self._config_file:
+            # only write the keys the file actually declares
             algo_config.from_file(
                 self._config_file,
                 nested_root_name=f"{self.node_name}.{algo_config_name.partition('Config')[0]}",
@@ -616,15 +774,21 @@ class BaseComponent(lifecycle.Node):
         :param callback:
         :type callback: GenericCallback
         """
+        name = callback.input_topic.name
+        topic = self._plugin_ros_topics.get(
+            name, name
+        )  # for topics coming from plugins
         _subscriber = self.create_subscription(
             msg_type=callback.input_topic.ros_msg_type,
-            topic=callback.input_topic.name,
+            topic=topic,
             qos_profile=callback.input_topic.qos_profile.to_ros(),
             callback=callback.callback,
             callback_group=self.callback_group,
         )
         self.get_logger().debug(
-            f"Started subscriber to topic: {callback.input_topic.name} of type {callback.input_topic.msg_type}"
+            f"Started subscriber to topic: {topic} of type "
+            f"{callback.input_topic.msg_type}"
+            + (f" for input '{name}'" if topic != name else "")
         )
         return _subscriber
 
@@ -722,16 +886,19 @@ class BaseComponent(lifecycle.Node):
         """
         Create required subscriptions, publications, timers, ... etc. to activate the node
         """
-        # Init any global node variables
-        self.init_variables()
-
-        # Update the component topics using the robot plugin if provided.
-        # When no plugin is attached, topics that opted in with use_plugin=True
-        # issue a warning and keep working
-        if self._robot_plugin is not None:
+        # Adapt the component's topics to whichever plugins are attached.
+        # NOTE: Plugin adaptation MUST run before init_variables(), as it replaces
+        # entries in `self.callbacks` with new objects and destroys the old
+        # subscribers, so a component that caches callback references during
+        # init_variables() would be
+        # left holding orphans
+        if self._plugins:
             self._use_robot_plugin()
         else:
             self._warn_orphaned_plugin_topics()
+
+        # Init any global node variables
+        self.init_variables()
 
         self.create_all_subscribers()
 
@@ -752,6 +919,9 @@ class BaseComponent(lifecycle.Node):
         # Setup node timers
         self.create_all_timers()
 
+        # Restart any TF lookups paused by a previous deactivation
+        self._resume_tf_listeners()
+
     def deactivate(self):
         """
         Destroy all declared subscriptions, publications, timers, ... etc. to deactivate the node
@@ -769,6 +939,13 @@ class BaseComponent(lifecycle.Node):
         self.destroy_all_subscribers()
 
         self.destroy_all_publishers()
+
+        # Stop TF lookups too: destroy_all_timers only owns the execution timer
+        self._pause_tf_listeners()
+
+        # Removing _exec_started to allow a clean reactivation of the component at runtime
+        if hasattr(self, "_exec_started"):
+            del self._exec_started
 
     def configure(self, config_file: Optional[str] = None):
         """
@@ -795,6 +972,8 @@ class BaseComponent(lifecycle.Node):
         self.get_logger().info("STARTING ALL SUBSCRIBERS")
         # Create subscribers
         for topic_name, callback in self.callbacks.items():
+            # Frame handling applies to plugin-fed non-ROS inputs too
+            self._attach_transform_provider(topic_name, callback)
             # Inputs bound to a non-ROS robot plugin transport are fed through
             # the feedback bus, not a ROS subscription
             if topic_name in self._external_topics:
@@ -822,7 +1001,9 @@ class BaseComponent(lifecycle.Node):
             if isinstance(publisher, Publisher):
                 publisher.set_node_name(self.node_name)
                 # Set ROS publisher for each output publisher
-                publisher.set_publisher(self._add_ros_publisher(publisher))
+                publisher.set_publisher(
+                    self._add_ros_publisher(publisher), clock=self.get_clock()
+                )
 
     def create_all_timers(self):
         """
@@ -853,11 +1034,22 @@ class BaseComponent(lifecycle.Node):
             node=self,
             action_type=self.action_type,
             action_name=action_name,
-            execute_callback=self.main_action_callback,
+            execute_callback=self._main_action_execute_callback,
             goal_callback=self._main_action_goal_callback,
             handle_accepted_callback=self._main_action_handle_accepted_callback,
             cancel_callback=self._main_action_cancel_callback,
             callback_group=action_callback_group,
+        )
+        # Cancels the ongoing goal for callers that do not hold its handle,
+        # through the action's own cancel service
+        self._main_action_cancel_client = self.create_client(
+            CancelGoal, f"{action_name}/_action/cancel_goal"
+        )
+        self._main_action_cancel_srv = self.create_service(
+            Trigger,
+            f"{self.get_name()}/cancel_main_action",
+            self._cancel_main_action_srv_callback,
+            callback_group=MutuallyExclusiveCallbackGroup(),
         )
 
     def create_all_action_clients(self):
@@ -909,7 +1101,10 @@ class BaseComponent(lifecycle.Node):
         """
         if hasattr(self, "_execution_timer"):
             self.get_logger().info("DESTROYING MAIN TIMER")
+            # Cancelled before it is destroyed
+            self._execution_timer.cancel()
             self.destroy_timer(self._execution_timer)
+            del self._execution_timer
 
     def destroy_all_subscribers(self):
         """
@@ -938,8 +1133,9 @@ class BaseComponent(lifecycle.Node):
         """
         self.get_logger().info("DESTROYING ALL PUBLISHERS")
         # Destroy health status publisher
-        self.destroy_publisher(self.health_status_publisher)
-        self.health_status_publisher = None
+        if self.health_status_publisher:
+            self.destroy_publisher(self.health_status_publisher)
+            self.health_status_publisher = None
 
         for publisher in self.publishers_dict.values():
             if publisher._publisher:
@@ -951,7 +1147,7 @@ class BaseComponent(lifecycle.Node):
         Destroys all node services
         """
         # Destroy node main Server if runtype is server
-        if self.run_type == ComponentRunType.SERVER:
+        if self.run_type == ComponentRunType.SERVER and hasattr(self, "server"):
             self.destroy_service(self.server)
         if (
             hasattr(self, "_maintain_default_services")
@@ -972,6 +1168,8 @@ class BaseComponent(lifecycle.Node):
             self, "action_server"
         ):
             self.action_server.destroy()
+            self.destroy_service(self._main_action_cancel_srv)
+            self.destroy_client(self._main_action_cancel_client)
 
     def destroy_all_action_clients(self):
         """
@@ -983,6 +1181,24 @@ class BaseComponent(lifecycle.Node):
         """destroy_all_service_clients."""
         pass
 
+    def destroy_node(self):
+        """Destroy the node, with the action servers and clients rclpy leaves.
+
+        Left alive, the main action server kept serving its action by name
+        after the launch ended, and a client looking for it later could send
+        its goal there, where nothing answers.
+
+        NOTE: rclpy leaves the lifecycle state machine too, and with it the
+        node's name and its lifecycle services in the graph, which is still
+        enough for a component started later under the same name to be taken
+        for up before it is. It is not destroyed here: rclpy reads the state
+        machine without checking that it still exists, so a thread reading it
+        afterwards would crash the process instead of raising
+        """
+        destroy_action_entities(self)
+        self._destroy_external_processors()
+        super().destroy_node()
+
     def config_from_file(self, config_file: str):
         """
         Configure component from file
@@ -993,30 +1209,6 @@ class BaseComponent(lifecycle.Node):
         self.config.from_file(
             config_file, nested_root_name=self.node_name, get_common=True
         )
-        # Update algorithms config from file
-        if self.algorithms_config:
-            # Load the file
-            ext: str = os.path.splitext(config_file)[1].lower()
-
-            with open(config_file, "r", encoding="utf-8") as f:
-                if ext in [".yaml", ".yml"]:
-                    raw_config: Dict[str, Any] = yaml.safe_load(f)
-                elif ext == ".json":
-                    raw_config = json.load(f)
-                elif ext == ".toml":
-                    raw_config = toml.load(f)
-                else:
-                    raise ValueError(f"Unsupported config format: {ext}")
-
-            for algo_name, algo_conf in self._algorithms_config.items():
-                config = raw_config
-                for key in [self.node_name, algo_name.partition("Config")[0]]:
-                    config = config.get(key, {})
-                if not config:
-                    continue
-                for item_key in algo_conf.keys():
-                    if hasattr(config, item_key):
-                        algo_conf[item_key] = getattr(config, item_key)
 
     def create_tf_listener(self, tf_config: TFListenerConfig) -> TFListener:
         """
@@ -1038,6 +1230,172 @@ class BaseComponent(lifecycle.Node):
         )  # timer to lookup the transform with given rate
         tf_handler.timer = transform_timer
         return tf_handler
+
+    # TRANSFORMS
+    @property
+    def tf_buffer(self) -> Buffer:
+        """The node's shared TF buffer, created on first use.
+
+        All frame pairs the component looks up share this buffer, so the node
+        subscribes to `/tf` and `/tf_static` exactly once however many sensors
+        it tracks.
+
+        :return: Shared TF buffer
+        :rtype: Buffer
+        """
+        if self._tf_buffer is None:
+            self._tf_buffer = Buffer()
+            self._tf_transform_listener = TransformListener(
+                buffer=self._tf_buffer, node=self
+            )
+        return self._tf_buffer
+
+    def get_transform_listener(
+        self, source_frame: str, goal_frame: str, static_tf: bool = False
+    ) -> TFListener:
+        """Get (or create) a listener polling the transform between two frames.
+
+        Listeners are cached per frame pair, so asking repeatedly - for
+        instance once per incoming message - is cheap.
+
+        :param source_frame: Frame the data is currently expressed in
+        :type source_frame: str
+        :param goal_frame: Frame the data should be expressed in
+        :type goal_frame: str
+        :param static_tf: Whether the transform is fixed, in which case polling
+            stops once it has been acquired
+        :type static_tf: bool
+
+        :return: Transform lookup handler for the pair. A listener whose source
+            and goal are the same frame is already resolved to the identity and
+            runs no lookup at all
+        :rtype: TFListener
+        """
+        key = (source_frame, goal_frame)
+        if listener := self._tf_listeners.get(key):
+            return listener
+
+        tf_config = TFListenerConfig(
+            source_frame=source_frame, goal_frame=goal_frame, static_tf=static_tf
+        )
+        listener = TFListener(
+            tf_config=tf_config, node_name=self.node_name, buffer=self.tf_buffer
+        )
+        # Same source and goal resolves to the identity without any lookup, so
+        # it needs no polling timer
+        if not listener.is_identity:
+            listener.timer = self.create_timer(
+                1 / tf_config.lookup_rate,
+                listener.timer_callback,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+        self._tf_listeners[key] = listener
+        return listener
+
+    def _pause_tf_listeners(self) -> None:
+        """Stop the TF lookup timers while the component is inactive.
+
+        The buffer and the listeners themselves are kept, so a transform that
+        was already resolved survives a deactivate/activate cycle instead of
+        having to be looked up again.
+        """
+        for listener in self._tf_listeners.values():
+            if listener.timer is not None:
+                listener.timer.cancel()
+
+    def _resume_tf_listeners(self) -> None:
+        """Restart the TF lookup timers paused by deactivation.
+
+        A static transform that has already been acquired stays cancelled: it
+        stopped its own timer on purpose and there is nothing left to look up.
+        """
+        for listener in self._tf_listeners.values():
+            if listener.timer is None:
+                continue
+            if listener.config.static_tf and listener.got_transform:
+                continue
+            listener.timer.reset()
+
+    def get_transform(
+        self, source_frame: str, goal_frame: str, static_tf: bool = False
+    ) -> Optional[TransformStamped]:
+        """Get the transform between two frames, if it has been resolved yet.
+
+        :param source_frame: Frame the data is currently expressed in
+        :type source_frame: str
+        :param goal_frame: Frame the data should be expressed in
+        :type goal_frame: str
+        :param static_tf: Whether the transform is fixed
+        :type static_tf: bool
+
+        :return: The transform, or None while it is still unavailable
+        :rtype: Optional[TransformStamped]
+        """
+        if not source_frame or not goal_frame or source_frame == goal_frame:
+            return None
+        return self.get_transform_listener(
+            source_frame, goal_frame, static_tf
+        ).transform
+
+    def log_once(self, key: str, message: str, level: str = "warning") -> None:
+        """Log a lasting condition the first time it is seen under `key`.
+
+        Use instead of rclpy's `once=True` which mutes by call site
+
+        :param key: Name of the condition, unique within the component
+        :type key: str
+        :param message: What to log the first time the condition is seen
+        :type message: str
+        :param level: Logger method to use: 'debug', 'info', 'warning',
+            'error' or 'fatal'
+        :type level: str
+        """
+        if key in self._logged_once:
+            return
+        self._logged_once.add(key)
+        getattr(self.get_logger(), level)(message)
+
+    def transform_input_to(
+        self, topic_name: str, goal_frame: str, static_tf: bool = False
+    ) -> None:
+        """Ask for an input's data expressed in a given frame.
+
+        The source frame is taken from each message's `header.frame_id`, so no
+        sensor frame has to be configured anywhere: the component states which
+        frame its algorithm needs, and the data is transformed on arrival.
+
+        Call this from `init_variables`, before subscribers are created.
+
+        :param topic_name: Name of the component input topic
+        :type topic_name: str
+        :param goal_frame: Frame the data should be expressed in, usually one
+            of the component's `config.frames`
+        :type goal_frame: str
+        :param static_tf: Whether the sensor is rigidly mounted, in which case
+            the transform is looked up once instead of continuously. Leave
+            False for anything on a moving mount, such as a pan-tilt camera.
+        :type static_tf: bool
+        """
+        self._input_frame_targets[topic_name] = (goal_frame, static_tf)
+
+    def _attach_transform_provider(self, topic_name: str, callback) -> None:
+        """Wire a callback up to resolve its own transform on every message.
+
+        The transform cannot be resolved ahead of time because the source frame
+        is only known once a message arrives, so the callback is handed a
+        resolver instead of a fixed transform.
+        """
+        target = self._input_frame_targets.get(topic_name)
+        if target is None:
+            return
+        goal_frame, static_tf = target
+
+        def _provider(cb) -> Optional[TransformStamped]:
+            if not cb.frame_id:
+                return None
+            return self.get_transform(cb.frame_id, goal_frame, static_tf=static_tf)
+
+        callback.set_transform_provider(_provider)
 
     def create_client(self, *args, **kwargs) -> Client:
         """
@@ -1088,17 +1446,135 @@ class BaseComponent(lifecycle.Node):
             # Register action to event to get executed on trigger when calling event.check_condition
             event.register_actions(actions)
 
+        # A monitored action watches its success condition as an event of its
+        # own, registered on first dispatch rather than here so that this
+        # component never subscribes to a success topic for an action that is
+        # never triggered
+        bind_monitored_actions(self.__actions, self)
+
         # Create ONE subscription per Topic
         self.__event_listeners = []
         for name, topic_obj in unique_topics.items():
+            self.__create_event_listener(name, topic_obj)
+
+    def __create_event_listener(self, name: str, topic_obj: Topic) -> None:
+        """Create the single subscription backing all events on a topic"""
+        # handle plugin fed topics (feedbacks)
+        if name in self._external_topics or topic_obj.use_plugin:
+            if self._subscribe_event_to_plugin_feedback(name, topic_obj):
+                return
+            # An input the plugin could not serve fell back to an ordinary ROS
+            # subscription, and its events follow it there
+            if name in self._external_topics or name not in self.callbacks:
+                self.get_logger().error(f"Events on '{name}' will never trigger.")
+                return
+        listener = self.create_subscription(
+            msg_type=topic_obj.ros_msg_type,
+            topic=topic_obj.name,
+            callback=partial(self.__event_topic_callback, name),
+            qos_profile=topic_obj.qos_profile.to_ros(),
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
+        self.__event_listeners.append(listener)
+
+    def add_runtime_event_listener(self, event: Event) -> None:
+        """Start monitoring an event that was not known at activation.
+
+        Unlike the events wired up in `_turn_on_events_management`, this is
+        called while the component is already running, from a worker thread.
+        Used by a monitored `Action` to begin watching its success condition on
+        first dispatch. Subscriptions created here live until the component is
+        deactivated, so repeat triggers and retries do not churn them.
+
+        :param event: Event to start monitoring
+        :type event: Event
+        """
+        with self._events_lock:
+            for topic in event.get_involved_topics():
+                if topic.name in self.__events_per_topic:
+                    self.__events_per_topic[topic.name].append(event)
+                    continue
+                self.__events_per_topic[topic.name] = [event]
+                self.__create_event_listener(topic.name, topic)
+
+    def _subscribe_event_to_plugin_feedback(self, topic_name: str, topic_obj) -> bool:
+        """Drive an event from the plugin feedback serving its topic.
+
+        For a feedback the plugin carries on a ROS topic, the event subscribes
+        to that topic. For one it serves over its own transport there is no ROS
+        traffic to subscribe to, so the event is fed from the feedback bus
+        instead. Either way messages arrive under the event's own topic name.
+
+        :param topic_name: Name of the event topic
+        :type topic_name: str
+        :param topic_obj: The event's declared topic
+        :type topic_obj: Topic
+        :return: Whether the event was bound to a plugin feedback; the reason is
+            logged when it was not
+        :rtype: bool
+        """
+        from ..robot.plugin import AmbiguousPluginEntryError
+
+        # Use whichever plugin the topic names (not just the robot plugin). So
+        # sensor plugin topics are resolved
+        plugin = self._plugin_for_topic(topic_obj)
+        if plugin is None:
+            self.get_logger().error(
+                f"Events on '{topic_name}' are not bound to a plugin: no attached "
+                f"plugin serves it (use_plugin={topic_obj.use_plugin!r})."
+            )
+            return False
+        try:
+            feedback = plugin.resolve_feedback(topic_name, topic_obj.msg_type.__name__)
+        except (TypeError, AmbiguousPluginEntryError) as e:
+            self.get_logger().error(
+                f"Events on '{topic_name}' are not bound to a plugin: the topic "
+                f"could not be bound to plugin '{plugin.id}': {e}"
+            )
+            return False
+        if feedback is None:
+            self.get_logger().error(
+                f"Events on '{topic_name}' are not bound to a plugin: plugin "
+                f"'{plugin.id}' has no matching feedback."
+            )
+            return False
+        # NOTE: The plugin may decode to a different message type than the recipe
+        # declared. Event conditions read attributes off the declared type, so
+        # a mismatched stream would misfire rather than simply not fire.
+        if feedback.msg_type is not topic_obj.msg_type:
+            self.get_logger().error(
+                f"Events on '{topic_name}' are not bound to a plugin: the plugin "
+                f"publishes '{feedback.msg_type.__name__}' but the event expects "
+                f"'{topic_obj.msg_type.__name__}'."
+            )
+            return False
+        if feedback.is_ros_topic:
+            # Subscribe where the plugin publishes, filed under the event's name
+            ros_topic = feedback.as_topic()
             listener = self.create_subscription(
-                msg_type=topic_obj.ros_msg_type,
-                topic=topic_obj.name,
-                callback=partial(self.__event_topic_callback, name),
-                qos_profile=topic_obj.qos_profile.to_ros(),
+                msg_type=ros_topic.ros_msg_type,
+                topic=ros_topic.name,
+                callback=partial(self.__event_topic_callback, topic_name),
+                qos_profile=ros_topic.qos_profile.to_ros(),
                 callback_group=MutuallyExclusiveCallbackGroup(),
             )
             self.__event_listeners.append(listener)
+            self.get_logger().info(
+                f"Events on '{topic_name}' bound to plugin feedback "
+                f"'{feedback.key}' via ROS topic '{ros_topic.name}'"
+            )
+            return True
+        # The event handler is the bus subscriber and decoded messages land in
+        # __event_topic_callback exactly as they would from a ROS subscription
+        handle = plugin.subscribe_feedback(
+            feedback=feedback,
+            on_ros_msg=partial(self.__event_topic_callback, topic_name),
+        )
+        self._robot_plugin_bus_handles.append(handle)
+        self.get_logger().info(
+            f"Events on '{topic_name}' bound to robot plugin feedback '{feedback.key}'"
+        )
+        return True
 
     def _turn_on_fallbacks_subscribers(self):
         # Create ONE subscription per Topic
@@ -1129,30 +1605,42 @@ class BaseComponent(lifecycle.Node):
         1. Updates Cache of all required events topics
         2. Re-evaluates all events that depend on this topic
         """
-        # Update Blackboard with stamped entry
-        self._events_topics_blackboard[topic_name] = EventBlackboardEntry(
-            msg=msg, timestamp=time.time()
-        )
+        # Guarded so that a monitored Action registering its success event from a
+        # worker thread cannot mutate the index while it is iterated here, nor
+        # the blackboard while it is lazily cleaned below.
+        # NOTE: the lock covers reading the blackboard, not evaluating the
+        # conditions read from it: held across evaluation, one slow condition
+        # stalled every other topic this component watches. Each event
+        # serializes its own evaluation
+        to_evaluate = []
+        with self._events_lock:
+            # Update Blackboard with stamped entry
+            self._events_topics_blackboard[topic_name] = EventBlackboardEntry(
+                msg=msg, timestamp=time.time()
+            )
 
-        # READ & CLEAN: Identify events dependent on this topic
-        relevant_events = self.__events_per_topic.get(topic_name, [])
+            # READ & CLEAN: Identify events dependent on this topic
+            relevant_events = self.__events_per_topic.get(topic_name, [])
 
-        for event in relevant_events:
-            # Instead of passing the raw blackboard
-            # we perform a lazy cleanup right here for the topics THIS event needs.
+            for event in relevant_events:
+                # Instead of passing the raw blackboard
+                # we perform a lazy cleanup right here for the topics THIS event needs.
 
-            clean_cache_subset = {}
-            for topic in event.get_involved_topics():
-                # This call performs the check and DELETES expired data if necessary
-                valid_entry = EventBlackboardEntry.get(
-                    self._events_topics_blackboard,
-                    topic.name,
-                    topic.data_timeout,
-                    event.get_last_processed_id(topic.name),
-                )
-                if valid_entry:
-                    clean_cache_subset[topic.name] = valid_entry
-            # Pass the clean subset to the event
+                clean_cache_subset = {}
+                for topic in event.get_involved_topics():
+                    # This call performs the check and DELETES expired data if necessary
+                    valid_entry = EventBlackboardEntry.get(
+                        self._events_topics_blackboard,
+                        topic.name,
+                        topic.data_timeout,
+                        event.get_last_processed_id(topic.name),
+                    )
+                    if valid_entry:
+                        clean_cache_subset[topic.name] = valid_entry
+                to_evaluate.append((event, clean_cache_subset))
+
+        # Pass each event the clean subset it was given, outside the lock
+        for event, clean_cache_subset in to_evaluate:
             event.check_condition(clean_cache_subset)
 
     def _add_event_action_pair(self, event: Event, action: Union[Action, List[Action]]):
@@ -1210,7 +1698,7 @@ class BaseComponent(lifecycle.Node):
 
         # Check if all callbacks of the selected topics got input messages
         for callback in inputs_dict_to_check.values():
-            if callback._subscriber and not callback.got_msg:
+            if not callback.got_msg:
                 return False
         return True
 
@@ -1422,46 +1910,51 @@ class BaseComponent(lifecycle.Node):
                 self._external_processors_json,
             ]
 
-        if self._robot_plugin is not None:
-            self.launch_cmd_args = ["--robot_plugin", self._robot_plugin_json]
+        if self._plugins:
+            self.launch_cmd_args = ["--plugins", self._plugins_json]
 
     @property
-    def _robot_plugin_json(self) -> str:
-        """Getter of the serialized robot plugin spec + feedback-bus endpoint.
+    def _plugins_json(self) -> str:
+        """Getter of the serialized plugin specs + shared feedback-bus endpoint.
 
-        Used to carry the robot plugin across the multiprocess launch boundary:
-        each component subprocess rebuilds a CLIENT plugin from this spec and
-        connects to the HOST feedback bus at ``bus_endpoint``.
+        Each component subprocess rebuilds CLIENT plugins from these
+        specs and connects to the HOST feedback bus at ``bus_endpoint``. The
+        specs carry each plugin's id, so the channels a subprocess subscribes
+        to are the ones the hosts publish on.
 
-        :return: JSON ``{"spec": <plugin spec>, "bus_endpoint": <name>}``
+        :return: JSON ``{"plugins": [<spec>, ...], "bus_endpoint": <name>}``
         :rtype: str
         """
-        if self._robot_plugin is None:
+        if not self._plugins:
             return "{}"
-        bus = self._robot_plugin.bus
-        endpoint = bus.endpoint if bus is not None else None
+        # Every plugin shares one bus, so the first one carrying it answers for
+        # all of them
+        endpoint = None
+        for plugin in self._plugins.values():
+            if plugin.bus is not None:
+                endpoint = plugin.bus.endpoint
+                break
         return json.dumps({
-            "spec": self._robot_plugin.to_spec(),
+            "plugins": [plugin.to_spec() for plugin in self._plugins.values()],
             "bus_endpoint": endpoint,
         })
 
-    @_robot_plugin_json.setter
-    def _robot_plugin_json(self, value: Union[str, bytes]):
-        """Setter that rebuilds a CLIENT robot plugin from a serialized spec.
+    @_plugins_json.setter
+    def _plugins_json(self, value: Union[str, bytes]):
+        """Setter that rebuilds CLIENT plugins from serialized specs.
 
-        :param value: JSON produced by the :attr:`_robot_plugin_json` getter
+        :param value: JSON produced by the :attr:`_plugins_json` getter
         :type value: Union[str, bytes]
         """
-        from ..robot.plugin import RobotPlugin
+        from ..robot.plugin import Plugin
 
         data = json.loads(value)
+        self._plugins = {}
         if not data:
-            self._robot_plugin = None
             return
-        self._robot_plugin = RobotPlugin.from_spec(
-            data["spec"],
-            bus_endpoint=data.get("bus_endpoint"),
-        )
+        endpoint = data.get("bus_endpoint")
+        for spec in data.get("plugins", []):
+            self.add_plugin(Plugin.from_spec(spec, bus_endpoint=endpoint))
 
     @property
     def _events_json(self) -> Union[str, bytes]:
@@ -1523,6 +2016,8 @@ class BaseComponent(lifecycle.Node):
                     )
                 # reparse the method using the given action name
                 method = getattr(self, action_dict["action_name"])
+                # Monitoring policy keys restore with their defaults when
+                # absent, so one class deserializes both plain and monitored
                 reconstructed_action = Action.deserialize_action(
                     serialized_action_dict=action_dict,
                     deserialized_method=method,
@@ -1576,6 +2071,7 @@ class BaseComponent(lifecycle.Node):
         :type value: str
         """
         serialized_types = json.loads(value)
+        new_types = []
         for s_t in serialized_types:
             module_name, _, class_name = s_t.rpartition(".")
             if not module_name:
@@ -1583,7 +2079,12 @@ class BaseComponent(lifecycle.Node):
             module = importlib.import_module(module_name)
             new_type = getattr(module, class_name)
             if issubclass(new_type, SupportedType):
-                self._additional_types.append(new_type)
+                new_types.append(new_type)
+        self._additional_types.extend(new_types)
+        # Topics look their type up in the supported types registry, which
+        # importing a type's module does not always fill (e.g. when a package
+        # registers its types in another module), so register them here
+        add_additional_datatypes(new_types)
 
     @property
     def _inputs_json(self) -> Union[str, bytes, bytearray]:
@@ -1664,58 +2165,55 @@ class BaseComponent(lifecycle.Node):
 
     @property
     def _external_processors_json(self) -> Union[str, bytes]:
-        """Getter of serialized external processors
+        """Getter of serialized external processors, with the socket of the
+        launcher's external processor server that serves them
 
         :return: Serialized external processors definition
         :rtype: Union[str, bytes]
         """
         return json.dumps({
-            topic_name: ([p.__name__ for p in processors], str(processor_type))  # type: ignore
-            for topic_name, (
-                processors,
-                processor_type,
-            ) in self._external_processors.items()
+            "endpoint": self._external_processors_endpoint,
+            "processors": {
+                key: ([p.__name__ for p in processors], str(processor_type))  # type: ignore
+                for key, (
+                    processors,
+                    processor_type,
+                ) in self._external_processors.items()
+            },
         })
 
     @_external_processors_json.setter
     def _external_processors_json(self, processors_serialized: Union[str, bytes]):
-        """Setter of external processors from JSON serialized processors
+        """Setter of external processors from JSON serialized processors. Each
+        processor is replaced by a client calling it in the launcher process
 
         :param processors_serialized: Serialized Processors Dict
         :type processors_serialized: Union[str, bytes]
         """
-        loaded_processors = json.loads(processors_serialized)
+        loaded = json.loads(processors_serialized)
+        endpoint = loaded["endpoint"]
 
-        # reconstruct the dictionary, validating the processor type string
         self._external_processors = {}
 
-        for key, processor_data in loaded_processors.items():
-            # get processor data and type
-            func_names = processor_data[0]
-            proc_type_str = processor_data[1]
-
-            # Validate string back to Enum-compatible string
-            valid_proc_type = ExternalProcessorType(proc_type_str)
-
-            # Initialize the list with function names
-            self._external_processors[key] = (func_names, valid_proc_type)
-
-            # Create sockets out of function names and connect them
-            current_processors_list = self._external_processors[key][0]
-
-            for idx, func_name in enumerate(current_processors_list):
-                sock_file = f"/tmp/{self.node_name}_{key}_{func_name}.socket"
-                if not os.path.exists(sock_file):
+        for key, (func_names, proc_type_str) in loaded["processors"].items():
+            clients = []
+            for idx in range(len(func_names)):
+                client = ExternalProcessorClient(
+                    endpoint,
+                    processor_id(self.node_name, key, idx),
+                    timeout=self.config.external_processor_timeout,
+                )
+                try:
+                    client.connect()
+                except OSError as e:
                     raise RuntimeError(
-                        f"File {sock_file} doesn't exists. The external processors have not been setup properly. Exiting .. "
-                    )
-
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(1)  # timeout set to 1s
-                sock.connect(sock_file)
-                # The processessing functions are a list which is the first element of the tuple
-                # stored in _external_processors dict
-                processor_data[0][idx] = sock
+                        f"Could not connect to the external processors at {endpoint}. The external processors have not been setup properly. Exiting .. "
+                    ) from e
+                clients.append(client)
+            self._external_processors[key] = (
+                clients,
+                ExternalProcessorType(proc_type_str),
+            )
 
     @property
     def _algorithms_json(self) -> Union[str, bytes, bytearray]:
@@ -1763,7 +2261,6 @@ class BaseComponent(lifecycle.Node):
     # TODO: Implement dunder methods for a more intuitive API with components
 
     # MAIN ACTION SERVER HELPER METHODS AND CALLBACKS
-    @abstractmethod
     def main_action_callback(self, goal_handle) -> Any:
         """
         Component main action server callback - used if component started with run_as_action_server=True
@@ -1776,14 +2273,22 @@ class BaseComponent(lifecycle.Node):
 
     def _main_action_goal_callback(self, _) -> GoalResponse:
         """
-        Goal callback for the main component action server
+        Goal callback for the main component action server. A new goal is
+        rejected while another one is ongoing: it has to finish or be canceled
+        first (see the 'cancel_main_action' service)
 
-        :param goal_request: _description_
+        :param goal_request: Incoming goal request
         :type goal_request: Any action goal handler type
-        :return: ACCEPT
+        :return: ACCEPT, or REJECT while a goal is ongoing
         :rtype: rclpy.action.GoalResponse
         """
-        # Cancel any ongoing action
+        with self._main_goal_lock:
+            ongoing = self._main_goal_handle is not None
+        if ongoing:
+            self.get_logger().warning(
+                "Rejected goal request: another goal is ongoing, cancel it first"
+            )
+            return GoalResponse.REJECT
         self.get_logger().info("Received goal request")
         return GoalResponse.ACCEPT
 
@@ -1792,13 +2297,81 @@ class BaseComponent(lifecycle.Node):
         Main component action server callback when handle is accepted
         """
         with self._main_goal_lock:
-            if self._main_goal_handle is not None and self._main_goal_handle.is_active:
-                # Abort the existing goal
-                self.get_logger().info("Aborting previous goal")
-                self._main_goal_handle.abort()
             self._main_goal_handle = goal_handle
             self.get_logger().info("Goal accepted")
             self._main_goal_handle.execute()
+
+    def _main_action_execute_callback(self, goal_handle):
+        """Runs the main action callback. The goal stays ongoing until the
+        callback returns, not only until it reaches a terminal state, so a new
+        goal never runs alongside the cleanup of the previous one
+        """
+        try:
+            return self.main_action_callback(goal_handle)
+        finally:
+            with self._main_goal_lock:
+                self._main_goal_handle = None
+
+    @component_action(
+        description={
+            "type": "function",
+            "function": {
+                "name": "cancel_main_goal",
+                "description": (
+                    "Stop the goal this component's action server is running, "
+                    "succeeding when nothing is running"
+                ),
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+    )
+    def cancel_main_goal(self, **_) -> ActionReturnType:
+        """Stop the goal the main action server is running, for a caller that
+        does not hold its handle.
+
+        An action rather than only a service, so stopping a component is
+        reachable the way everything else about it is: from an event, a routine
+        step, the runtime API, the UI and an LLM tool. The `cancel_main_action`
+        service calls this too.
+
+        :return: (success, message). What the caller asked for is that no goal
+            is running, so finding none already running is a success. A
+            component that has no action server at all is a different matter,
+            and is reported as a failure
+        :rtype: ActionReturnType
+        """
+        if self.run_type != ComponentRunType.ACTION_SERVER:
+            return False, f"Component '{self.node_name}' has no action server"
+        with self._main_goal_lock:
+            goal_handle = self._main_goal_handle
+        if goal_handle is None:
+            return True, "No ongoing goal to cancel"
+        if not goal_handle.is_active:
+            # Cancelled or finished, but its callback has not returned, so the
+            # goal is still the ongoing one and new goals are still rejected.
+            # Answering "nothing to cancel" here, while the server refuses
+            # goals there, is two answers read off one state
+            return True, "The ongoing goal is already stopping"
+        request = CancelGoal.Request()
+        request.goal_info.goal_id = goal_handle.goal_id
+        # Not waited on: the cancel is carried out by the action server itself
+        self._main_action_cancel_client.call_async(request)
+        return True, "Cancel requested for the ongoing goal"
+
+    def _cancel_main_action_srv_callback(
+        self, _, response: Trigger.Response
+    ) -> Trigger.Response:
+        """Serve `cancel_main_goal` over a plain Trigger service.
+
+        The same operation with a second door on it: a `Trigger` is what a
+        terminal or another node reaches for, without knowing this framework
+
+        :param response: Whether a cancel was requested, and why not
+        :type response: Trigger.Response
+        :rtype: Trigger.Response
+        """
+        response.success, response.message = self.cancel_main_goal()
+        return response
 
     def _main_action_cancel_callback(self, _) -> Optional[CancelResponse]:
         """Main component action server callback when handle is canceled
@@ -1863,7 +2436,6 @@ class BaseComponent(lifecycle.Node):
         """
         self._main_srv_name = value
 
-    @abstractmethod
     def main_service_callback(self, request, response):
         """
         Component main service callback - used if component started with run_as_server=True
@@ -1908,12 +2480,13 @@ class BaseComponent(lifecycle.Node):
                 callback=self._configure_from_file_srv_callback,
                 callback_group=MutuallyExclusiveCallbackGroup(),
             ),
-            # Run component method
+            # Run component method.
+            # NOTE: Using reentrant, unlike the configuration services above, in order to execute a cancel method and stop
             self.create_service(
                 srv_type=ExecuteMethod,
                 srv_name=f"{self.get_name()}/execute_method",
                 callback=self._execute_method_srv_callback,
-                callback_group=MutuallyExclusiveCallbackGroup(),
+                callback_group=ReentrantCallbackGroup(),
             ),
         ]
 
@@ -1934,12 +2507,11 @@ class BaseComponent(lifecycle.Node):
         """
         try:
             # Reconfigure and restart the node
-            reconfigured = self.reconfigure(request.path_to_file)
-            if reconfigured:
-                response.success = True
-            else:
-                response.success = False
-                response.error_msg = "Failed to Restart the node"
+            response.success, message = self.reconfigure(
+                request.path_to_file, keep_alive=request.keep_alive
+            )
+            if not response.success:
+                response.error_msg = message
         except Exception as e:
             response.success = False
             response.error_msg = f"{e}"
@@ -1963,7 +2535,18 @@ class BaseComponent(lifecycle.Node):
 
         param_type = self.config.get_attribute_type(param_name)
         try:
-            parsed_param = param_type(param_str_value) if param_type else None
+            if param_type is bool:
+                # NOTE: Handle bool separately, as bool(str) only asks whether the string is non-empty, so
+                # "false" would come out True.
+                word = param_str_value.strip().lower()
+                if word in ("true", "1", "yes", "on"):
+                    parsed_param = True
+                elif word in ("false", "0", "no", "off"):
+                    parsed_param = False
+                else:
+                    raise ValueError(f"'{param_str_value}' is not a boolean")
+            else:
+                parsed_param = param_type(param_str_value) if param_type else None
             self.config.update_value(param_name, parsed_param)
             self.get_logger().debug(
                 f"Updates {self.node_name} config param {param_name} to : {parsed_param}"
@@ -2124,6 +2707,10 @@ class BaseComponent(lifecycle.Node):
     ) -> Optional[str]:
         """Replaces a component input topic by a new topic
 
+        The explicit swap behind the ReplaceTopic service. The input's identity
+        changes, so the callbacks dict is re-keyed by the new name and
+        ``in_topics`` is updated to match.
+
         :param topic_name: Old Topic name
         :type topic_name: str
         :param new_name: New topic name
@@ -2137,7 +2724,7 @@ class BaseComponent(lifecycle.Node):
             topic_name[1:] if topic_name.startswith("/") else topic_name
         )
 
-        if topic_name not in self.callbacks.keys():
+        if normalized_topic_name not in self.callbacks.keys():
             error_msg = f"Topic {topic_name} is not found in Component inputs"
             return error_msg
 
@@ -2162,9 +2749,11 @@ class BaseComponent(lifecycle.Node):
 
             new_callback.set_subscriber(self._add_ros_subscriber(new_callback))
 
-        # Update callbacks dictionary
+        # Update callbacks dictionary. The plugin's binding was to the name
+        # being retired thus remove that here as well
+        self._plugin_ros_topics.pop(normalized_topic_name, None)
         self.callbacks.pop(normalized_topic_name)
-        self.callbacks[new_name] = new_callback
+        self.callbacks[new_topic.name] = new_callback
 
         # update the internal lists
         old_topic = old_callback.input_topic
@@ -2205,7 +2794,7 @@ class BaseComponent(lifecycle.Node):
             topic_name[1:] if topic_name.startswith("/") else topic_name
         )
 
-        if topic_name not in self.publishers_dict.keys():
+        if normalized_topic_name not in self.publishers_dict.keys():
             error_msg = f"Topic {topic_name} is not found in Component outputs"
             return error_msg
 
@@ -2229,7 +2818,9 @@ class BaseComponent(lifecycle.Node):
             self.destroy_publisher(publisher._publisher)
 
             self.get_logger().info(f"Creating publisher for new topic '{new_name}'")
-            publisher.set_publisher(self._add_ros_publisher(publisher))
+            publisher.set_publisher(
+                self._add_ros_publisher(publisher), clock=self.get_clock()
+            )
 
         # Update publishers_dict
         self.publishers_dict.pop(normalized_topic_name)
@@ -2281,16 +2872,49 @@ class BaseComponent(lifecycle.Node):
                 response.error_msg = error_msg
 
         elif request.direction == ReplaceTopic.Request.OUTPUT_TOPIC:
-            self._replace_output_topic(
+            error_msg = self._replace_output_topic(
                 request.old_name, request.new_name, request.new_msg_type
             )
-            response.success = False
-            response.error_msg = "Not implemented"
+            if not error_msg:
+                response.success = True
+            else:
+                response.success = False
+                response.error_msg = error_msg
         else:
             response.success = False
             response.error_msg = f"Got invalid direction value '{request.direction}'. Direction can only be in [{ReplaceTopic.Request.INPUT_TOPIC} -> input, or {ReplaceTopic.Request.OUTPUT_TOPIC} -> output]"
 
         return response
+
+    def _is_remotely_callable(self, name: str) -> bool:
+        """Whether the ExecuteMethod service may call a method by this name.
+
+        Anything decorated with @component_action or @component_fallback is,
+        and so is a public method defined by a component class deriving from
+        BaseComponent: a recipe can bind those in an Action, and the Monitor
+        calls them over this service. BaseComponent's own undecorated methods
+        and rclpy's are not, nor is any private name, so the service cannot
+        destroy the node or reach the component's internals.
+        """
+        if name.startswith("_"):
+            return False
+        if self.__remote_methods is None:
+            self.__remote_methods = set(
+                get_methods_with_decorator(self, decorator_name="component_action")
+            ) | set(
+                get_methods_with_decorator(self, decorator_name="component_fallback")
+            )
+        if name in self.__remote_methods:
+            return True
+        for cls in type(self).__mro__:
+            if name in vars(cls):
+                # The class that defines the name decides
+                return (
+                    inspect.isfunction(vars(cls)[name])
+                    and issubclass(cls, BaseComponent)
+                    and cls is not BaseComponent
+                )
+        return False
 
     @log_srv
     def _execute_method_srv_callback(
@@ -2300,41 +2924,38 @@ class BaseComponent(lifecycle.Node):
             response.success = False
             response.error_msg = f"Component {self.node_name} does not have a method with requested name '{request.name}'"
             return response
+        if not self._is_remotely_callable(request.name):
+            response.success = False
+            response.error_msg = (
+                f"Method '{request.name}' of component {self.node_name} cannot be "
+                "called over the service. Only component actions, fallbacks and "
+                "public methods of the component's own class are"
+            )
+            return response
         kwargs = {}
         if request.kwargs_json:
             try:
-                kwargs = json.loads(request.kwargs_json)
-            except json.decoder.JSONDecodeError as e:
+                # Rebuilds anything the caller could not send as plain JSON,
+                # such as a ROS message, into the value the method expects
+                kwargs = from_jsonable(json.loads(request.kwargs_json))
+            except (json.decoder.JSONDecodeError, ValueError) as e:
                 response.success = False
                 response.error_msg = (
-                    f"Expecting json style keyword arguments, got {request.kwargs_json}"
+                    f"Could not read the arguments of '{request.name}': {e}"
                 )
                 self.get_logger().warning(f"Error parsing request parameters: {e}")
                 return response
         try:
             method = getattr(self, request.name)
-            result = method(**kwargs)
-            if isinstance(result, bool):
-                response.success = result
-                # TODO: If the error is caught in the method and it returns false
-                # we consider this a failure. This is for backward compatibility
-                # Thus component actions cannot return False as a legitimate
-                # response. We should ensure all component actions in downstream
-                # packages are modified before changing this behaviour.
-                if not result:
-                    response.error_msg = f"The method '{request.name}' executed but returned False, indicating failure without an exception."
-                else:
-                    response.response_json = json.dumps(result)
-            # NOTE: empty responses are considered successful
-            elif result is None:
-                response.success = True
+            # Actions return (success, message) per the action contract. The
+            # message carries a result when the action succeeded and an error
+            # when it failed
+            success, message = parse_action_result(method(**kwargs), request.name)
+            response.success = success
+            if success:
+                response.response_json = json.dumps(message)
             else:
-                response.success = True
-                try:
-                    response.response_json = json.dumps(result)
-                except (TypeError, ValueError) as e:
-                    response.response_json = ""
-                    response.error_msg = f"The method '{request.name}' returned a value that is not JSON serializable: {e}"
+                response.error_msg = message
         except Exception as e:
             response.success = False
             response.error_msg = f"Component {self.node_name} has a method with requested name '{request.name}' but the following error raised while running: {e}"
@@ -2377,7 +2998,7 @@ class BaseComponent(lifecycle.Node):
         if len(self._external_processors):
             for processors, _ in self._external_processors.values():
                 for processor in processors:
-                    if isinstance(processor, socket.socket):
+                    if isinstance(processor, ExternalProcessorClient):
                         processor.close()
 
     # MAIN
@@ -2399,7 +3020,7 @@ class BaseComponent(lifecycle.Node):
         # Execute main loop
         self._execution_step()
 
-        # Execute once
+        # Execute once per activation (the flag is cleared on deactivation)
         if not hasattr(self, "_exec_started"):
             self._execute_once()
             if hasattr(self, "_extra_execute_once"):
@@ -2469,7 +3090,11 @@ class BaseComponent(lifecycle.Node):
         :return: Methods names
         :rtype: List[str]
         """
-        return get_methods_with_decorator(self, decorator_name="component_action")
+        actions = get_methods_with_decorator(self, decorator_name="component_action")
+        if self.run_type != ComponentRunType.ACTION_SERVER:
+            # Every component inherits it, only one kind of component can do it
+            actions = [name for name in actions if name != "cancel_main_goal"]
+        return actions
 
     def __wait_for_node_start(self) -> bool:
         """Executes a waiting loop until the node is discoverable in ROS
@@ -2520,16 +3145,16 @@ class BaseComponent(lifecycle.Node):
         return True
 
     @component_action
-    def start(self, **_) -> bool:
+    def start(self, **_) -> ActionReturnType:
         """
         Start the component - trigger_activate
 
-        :return: If the component is started
-        :rtype: bool
+        :return: If the component is started, with a reason when it is not
+        :rtype: ActionReturnType
         """
         if self.lifecycle_state == LifecycleStateMsg.PRIMARY_STATE_ACTIVE:
             # Component already active
-            return True
+            return True, f"Component '{self.node_name}' is already active"
 
         elif self.lifecycle_state in [
             LifecycleStateMsg.PRIMARY_STATE_UNCONFIGURED,
@@ -2541,20 +3166,29 @@ class BaseComponent(lifecycle.Node):
         transition_done = self.__wait_for_state_transition()
 
         if not transition_done:
-            return False
+            return (
+                False,
+                f"Component '{self.node_name}' is stuck in a lifecycle transition",
+            )
 
         # configured and inactive
         self.trigger_activate()
 
-        return self.__wait_for_node_start()
+        if not self.__wait_for_node_start():
+            return (
+                False,
+                f"Component '{self.node_name}' did not come up within "
+                f"{self.config.wait_for_restart_time} secs",
+            )
+        return True, f"Component '{self.node_name}' started"
 
     @component_action
-    def stop(self, **_) -> bool:
+    def stop(self, **_) -> ActionReturnType:
         """
         Stop the component - trigger_deactivate
 
-        :return: If the component is stopped
-        :rtype: bool
+        :return: If the component is stopped, with a reason when it is not
+        :rtype: ActionReturnType
         """
         if self.lifecycle_state in [
             LifecycleStateMsg.PRIMARY_STATE_UNCONFIGURED,
@@ -2562,19 +3196,24 @@ class BaseComponent(lifecycle.Node):
             LifecycleStateMsg.PRIMARY_STATE_FINALIZED,
         ]:
             # Already not active
-            return True
+            return True, f"Component '{self.node_name}' is already not active"
 
         transition_done = self.__wait_for_state_transition()
 
         if not transition_done:
-            return False
+            return (
+                False,
+                f"Component '{self.node_name}' is stuck in a lifecycle transition",
+            )
 
         self.trigger_deactivate()
 
-        return True
+        return True, f"Component '{self.node_name}' stopped"
 
     @component_action
-    def reconfigure(self, new_config: Any, keep_alive: bool = False, **_) -> bool:
+    def reconfigure(
+        self, new_config: Any, keep_alive: bool = False, **_
+    ) -> ActionReturnType:
         """
         Reconfigure the component - cleanup->stop->trigger_configure->start
 
@@ -2583,8 +3222,8 @@ class BaseComponent(lifecycle.Node):
         :param keep_alive: Reconfigure while the component is online, defaults to False
         :type keep_alive: bool, optional
 
-        :return: If the component is Reconfigured
-        :rtype: bool
+        :return: If the component is Reconfigured, with a reason when it is not
+        :rtype: ActionReturnType
         """
         self.get_logger().warning("Reconfiguring component...")
 
@@ -2594,13 +3233,13 @@ class BaseComponent(lifecycle.Node):
                 self.configure(config_file=new_config)
             elif isinstance(new_config, self.config.__class__):
                 self.config = new_config
-            return True
+            return True, f"Component '{self.node_name}' reconfigured in place"
 
         initial_state = self.lifecycle_state
 
         reactivate = initial_state >= LifecycleStateMsg.PRIMARY_STATE_ACTIVE
 
-        if initial_state == LifecycleStateMsg.PRIMARY_STATE_UNCONFIGURED:
+        if initial_state == LifecycleStateMsg.PRIMARY_STATE_INACTIVE:
             # Already configured -> cleanup first
             self.trigger_cleanup()
 
@@ -2612,7 +3251,10 @@ class BaseComponent(lifecycle.Node):
         transition_done = self.__wait_for_state_transition()
 
         if not transition_done:
-            return False
+            return (
+                False,
+                f"Component '{self.node_name}' is stuck in a lifecycle transition",
+            )
 
         # set new config as params attr
         if isinstance(new_config, str):
@@ -2625,17 +3267,22 @@ class BaseComponent(lifecycle.Node):
 
         if reactivate:
             self.trigger_activate()
-            return self.__wait_for_node_start()
+            if not self.__wait_for_node_start():
+                return (
+                    False,
+                    f"Component '{self.node_name}' did not come back up after "
+                    "reconfiguring",
+                )
 
-        return True
+        return True, f"Component '{self.node_name}' reconfigured"
 
     @component_action
-    def restart(self, *, wait_time: Optional[float] = None, **_) -> bool:
+    def restart(self, *, wait_time: Optional[float] = None, **_) -> ActionReturnType:
         """
         Restart the component - stop->start
 
-        :return: If the component is Reconfigured
-        :rtype: bool
+        :return: If the component is restarted, with a reason when it is not
+        :rtype: ActionReturnType
         """
 
         if self.lifecycle_state == LifecycleStateMsg.PRIMARY_STATE_UNCONFIGURED:
@@ -2648,7 +3295,10 @@ class BaseComponent(lifecycle.Node):
 
         if not transition_done:
             # timeout
-            return False
+            return (
+                False,
+                f"Component '{self.node_name}' is stuck in a lifecycle transition",
+            )
 
         if wait_time:
             self.get_logger().warning(
@@ -2658,12 +3308,17 @@ class BaseComponent(lifecycle.Node):
 
         # not configured -> configure and start
         self.trigger_activate()
-        return self.__wait_for_node_start()
+        if not self.__wait_for_node_start():
+            return (
+                False,
+                f"Component '{self.node_name}' did not come back up after restarting",
+            )
+        return True, f"Component '{self.node_name}' restarted"
 
     @component_action
     def set_param(
         self, param_name: str, new_value: Any, keep_alive: bool = True, **_
-    ) -> bool:
+    ) -> ActionReturnType:
         """
         Change the value of one component parameter
 
@@ -2674,10 +3329,8 @@ class BaseComponent(lifecycle.Node):
         :param keep_alive: To keep the component running when updating value, defaults to True
         :type keep_alive: bool, optional
 
-        :raises Exception: Parameter could not be updated to given value
-
-        :return: Parameter updated
-        :rtype: bool
+        :return: Parameter updated, with the reason when it is not
+        :rtype: ActionReturnType
         """
         try:
             if keep_alive:
@@ -2686,14 +3339,14 @@ class BaseComponent(lifecycle.Node):
                 self.stop()
                 self.config.update_value(param_name, new_value)
                 self.start()
-        except Exception:
-            raise
-        return True
+        except Exception as e:
+            return False, f"Could not update parameter '{param_name}': {e}"
+        return True, f"Parameter '{param_name}' updated to '{new_value}'"
 
     @component_action
     def set_params(
         self, params_names: List[str], new_values: List, keep_alive: bool = True, **_
-    ) -> bool:
+    ) -> ActionReturnType:
         """
         Change the value of multiple component parameters
 
@@ -2704,10 +3357,8 @@ class BaseComponent(lifecycle.Node):
         :param keep_alive: To keep the component running when updating value, defaults to True
         :type keep_alive: bool, optional
 
-        :raises Exception: Parameter could not be updated to given value
-
-        :return: Parameter updated
-        :rtype: bool
+        :return: Parameters updated, with the reason when they are not
+        :rtype: ActionReturnType
         """
         try:
             if keep_alive:
@@ -2718,9 +3369,9 @@ class BaseComponent(lifecycle.Node):
                 for param_name, new_value in zip(params_names, new_values):
                     self.config.update_value(param_name, new_value)
                 self.start()
-        except Exception:
-            raise
-        return True
+        except Exception as e:
+            return False, f"Could not update parameters {params_names}: {e}"
+        return True, f"Parameters {params_names} updated"
 
     # END OF ACTIONS
 
@@ -2779,7 +3430,16 @@ class BaseComponent(lifecycle.Node):
             elif self.__fallbacks.on_any_fail:
                 self.__fallbacks_giveup = self.__fallbacks.execute_generic_fallback()
 
-            # Update the health status from the fallback after execution
+            else:
+                # No policy is defined for this failure, so there is no fallback
+                # status to adopt.
+                self.get_logger().warning(
+                    "No fallback policy is defined for detected failure -> Failure is broadcasted",
+                    once=True,
+                )
+                return
+
+            # Update the health status from the fallback that just ran
             self.health_status.value = self.__fallbacks.latest_status
 
         except ValueError:
@@ -2920,10 +3580,13 @@ class BaseComponent(lifecycle.Node):
             )
 
     @component_fallback
-    def broadcast_status(self, **_) -> None:
+    def broadcast_status(self, **_) -> ActionReturnType:
         """
         Component fallback defined to only broadcast the current state so it is handled by an external manager.
         Used as the default fallback strategy for any system (external) failure
+
+        :return: Whether the status was broadcast
+        :rtype: ActionReturnType
         """
         # If node is active publish status
         if (
@@ -2931,6 +3594,13 @@ class BaseComponent(lifecycle.Node):
             and self.lifecycle_state == LifecycleStateMsg.PRIMARY_STATE_ACTIVE
         ):
             self.health_status_publisher.publish(self.health_status())
+            return True, f"Broadcast status of '{self.node_name}'"
+        # NOTE: reported as a failure so the fallback ladder does not treat a
+        # status that was never published as a successful recovery
+        return (
+            False,
+            f"Cannot broadcast status of '{self.node_name}', it is not active",
+        )
 
     # LIFECYCLE ON TRANSITIONS CUSTOM METHODS
     @property
@@ -3000,6 +3670,11 @@ class BaseComponent(lifecycle.Node):
 
             # Create external processors
             self._attach_external_processors()
+
+            # Every activation starts with the full fallback budget, so a
+            # component that gave up can recover after a restart
+            self.__fallbacks.reset()
+            self.__fallbacks_giveup = False
 
             # Create failure check timer
             self.__fallbacks_check_timer = self.create_timer(
