@@ -1,14 +1,21 @@
-# Creating a Robot Plugin
+# Creating a Plugin
 
-A **robot plugin** adapts a Sugarcoat-based stack to one specific robot. It maps
-generic component I/O (`Twist`, `Odometry`, `Imu`, …) to whatever the robot
-actually exposes — ROS topics, ROS services, UDP, HTTP, or a vendor SDK — and
-can additionally contribute high-level **actions** (`stand_up`, `backflip`) and
-**events** (`fall_detected`, `low_battery`) that recipes consume directly.
+A **plugin** adapts a Sugarcoat-based stack to one specific piece of hardware. It
+maps generic component I/O (`Twist`, `Odometry`, `Imu`, …) to whatever the
+hardware actually exposes — ROS topics, ROS services, UDP, HTTP, or a vendor SDK
+— and can additionally contribute high-level **actions** (`stand_up`, `backflip`)
+and **events** (`fall_detected`, `low_battery`) that recipes consume directly.
 Component code never changes.
 
-A plugin author subclasses {py:class}`~ros_sugar.robot.RobotPlugin`. One plugin
-instance is passed to the `Launcher`.
+Plugins come in two roles:
+
+| Base class | Represents | Per recipe |
+|:--|:--|:--|
+| {py:class}`~ros_sugar.robot.RobotPlugin` | The robot itself | exactly one |
+| {py:class}`~ros_sugar.robot.SensorPlugin` | A sensor that is not part of the robot's own hardware — an inspection camera bolted on, a fixed camera watching a room | any number |
+
+The role is **intrinsic**: it follows from the base class you subclass, is
+read-only, and a recipe cannot attach a plugin under a different role.
 
 ```{tip}
 A complete, runnable reference plugin lives at
@@ -44,15 +51,17 @@ component thread — the bus is in-process and there is no CLIENT role.
 ```{important}
 Because the plugin must be reconstructable in component subprocesses, its
 `__init__` must be **declarative** — accept only JSON-serializable keyword
-arguments and perform **no I/O**. Open sockets and start threads in
-`on_activate()`, not `__init__()`.
+arguments and perform **no I/O**. Sockets, threads and heartbeats are opened
+for you by the plugin HOST; if you need node-dependent setup of your own,
+override `on_attached(node, bus)`.
 ```
 
 ## Building Blocks
 
 | Class | Role |
 |:------|:-----|
-| {py:class}`~ros_sugar.robot.RobotPlugin` | The plugin itself — subclass this. |
+| {py:class}`~ros_sugar.robot.RobotPlugin` / {py:class}`~ros_sugar.robot.SensorPlugin` | The plugin itself — subclass one of these. |
+| {py:class}`~ros_sugar.robot.Mount` | Where a sensor sits, when nothing else publishes its frame into TF. |
 | {py:class}`~ros_sugar.robot.Transport` | Where data comes from / goes to: `UdpTransport`, `HttpTransport`, `SdkCallbackTransport`, `RosTopicTransport`, `RosServiceTransport`. |
 | {py:class}`~ros_sugar.robot.Feedback` | One telemetry stream — a standard type name, a `SupportedType`, a transport, and a decoder. |
 | {py:class}`~ros_sugar.robot.RobotCommand` | One command surface — a standard type name, a transport, and an encoder. |
@@ -63,7 +72,11 @@ arguments and perform **no I/O**. Open sockets and start threads in
 
 Use `create_supported_type()` to turn a robot's ROS message into a
 `SupportedType`, optionally with a `callback` (ROS message → Python value, for
-feedback) and/or `converter` (Python value → ROS message, for commands):
+feedback) and/or `converter` (Python value → ROS message, for commands).
+
+Both are checked against their annotations, so they must be annotated functions
+rather than bare lambdas: a `callback`'s first argument must be annotated with
+the ROS message type, and its return with a non-ROS Python type.
 
 ```python
 import numpy as np
@@ -93,7 +106,11 @@ from ros_sugar.robot import (
     UdpTransport, create_supported_type,
 )
 
-RobotBattery = create_supported_type(RosFloat32, callback=lambda m: m.data)
+def _battery_callback(msg: RosFloat32) -> float:
+    return msg.data
+
+
+RobotBattery = create_supported_type(RosFloat32, callback=_battery_callback)
 
 
 def _decode_battery(raw: bytes):
@@ -113,12 +130,20 @@ the plugin HOST runs it on a background thread while active. A transport may set
 `route_via_host=True` so commands are forwarded through the HOST (use for
 session-bound protocols where a single client must own the connection).
 
-## Step 3: Subclass `RobotPlugin`
+## Step 3: Subclass a Plugin Base
 
-Construction is **zero-argument**: a `RobotPlugin` represents a *specific* robot,
-so every endpoint and tuning knob is part of the plugin's identity — declared as
-class attributes, not constructor parameters. Recipe authors write
-`MyRobotPlugin()` and nothing more.
+A plugin represents a *specific* piece of hardware, so its endpoints and tuning
+knobs are part of its identity — declared as class attributes rather than
+constructor parameters. Recipe authors normally write `MyRobotPlugin()` and
+nothing more.
+
+Two keyword arguments are **reserved by the framework**, available whether or
+not your `__init__` declares them:
+
+| Argument | Available on | Purpose |
+|:--|:--|:--|
+| `id` | every plugin | Identity within a recipe. Defaults to a slug of the metadata name. Needed only when two plugins of the same kind are attached. |
+| `frame_id` | sensor plugins | Name of the frame this sensor's data is in. Defaults to `<id>_frame`. A robot names the frame attached to its body with `base_frame` instead. |
 
 ```python
 class MyRobotPlugin(RobotPlugin):
@@ -141,11 +166,15 @@ class MyRobotPlugin(RobotPlugin):
         self.transports = {"telemetry": telemetry, "commands": commands}
 
         self.feedbacks = {
-            "Float32": Feedback("Float32", RobotBattery, telemetry,
-                                decoder=_decode_battery, rate_hz=50.0),
+            "Float32": Feedback(
+                key="Float32", msg_type=RobotBattery, transport=telemetry,
+                decoder=_decode_battery, rate_hz=50.0,
+            ),
         }
         self.commands = {
-            "Twist": RobotCommand("Twist", commands, encoder=_encode_twist),
+            "Twist": RobotCommand(
+                key="Twist", transport=commands, encoder=_encode_twist,
+            ),
         }
         self.actions = ActionRegistry({
             "stand_up": lambda: Action(method=lambda: commands.send(b"\x21\x01\x02\x02")),
@@ -164,17 +193,74 @@ class MyRobotPlugin(RobotPlugin):
 
 Notes:
 
-- `feedbacks` / `commands` are keyed by the **standard message-type name** they
-  stand in for — matched against component input/output topic message types.
+- `feedbacks` / `commands` are resolved against a component topic **by name
+  first** — a topic named after one of your registry keys binds to that entry —
+  falling back to a unique match on message type. So keying by message-type name
+  (`"Twist"`, `"Odometry"`) is the convention when you expose one entry per type;
+  when you expose several of the same type (a humanoid's `"left_arm"` /
+  `"right_arm"` JointStates) use descriptive keys and have the recipe name its
+  topics to match.
 - `actions` entries are **factories** returning fresh `Action` objects; `events`
   entries are factories returning `Event` objects, so recipes can pass per-call
   arguments.
 - `Feedback.as_topic()` yields the topic events reference — the real ROS topic
   for `RosTopicTransport` feedbacks, or a synthetic bus channel for everything
   else.
-- Override `on_load(node)`, `on_activate()`, `on_deactivate()` only if you need
-  custom HOST-side setup; the defaults open transports, start the bus and run
-  heartbeats for you.
+- Override `on_attached(node, bus)` only if you need custom HOST-side setup —
+  binding a `RosServiceTransport` client is the canonical case. The HOST already
+  opens transports, wires decoders to the bus and runs heartbeats for you.
+- Override `on_detached(node, bus)` to leave the hardware in a safe state on
+  shutdown. It runs on the HOST **before** the transports close, so the plugin
+  can still reach the device: a lidar has to be told to stop its motor, and
+  closing the port does not do it. Anything raised here is logged and does not
+  stop teardown.
+- Decorate an action factory with `plugin_action(description=...)` to attach an
+  OpenAI-style tool description, either a plain string or a `function` block
+  with a parameter schema. `plugin.actions.tool_descriptions(namespace="robot")`
+  then returns a ready-to-use tool list for an orchestrating LLM, falling back
+  to the factory's first docstring line where no description was given.
+
+### Addressable by name
+
+Attaching a plugin registers everything it contributes with the Monitor, under
+the plugin's id: `"lite3/stand_up"` is an action, `"lite3/low_battery"` a
+condition. A routine step, an event added at runtime and a caller of the runtime
+API can then name them, exactly as they name a component's actions. Nothing has
+to change in the recipe: `launcher.on(plugin.events.low_battery(0.15),
+plugin.actions.sit())` still holds the objects directly.
+
+```python
+# A mission written from outside the recipe, over the runtime API
+{"name": "patrol", "steps": [
+    {"ref": "lite3/stand_up", "timeout": 5.0, "max_retries": 2},
+    {"ref": "front_cam/aim", "kwargs": {"pan": 0.5}},
+]}
+```
+
+Three things follow for a plugin author:
+
+- **A factory's keyword arguments are what a step can set.** The step's
+  monitoring policy — `success`, `timeout`, `max_retries`, `cancel_method` and
+  the rest — is handed to the factory, so a factory that takes `**action_kwargs`
+  and passes them on to the `Action` it builds can be monitored, retried and
+  cancelled like any other step. One that takes none can still be run; it just
+  cannot be given a policy, and is told so by name if a step tries.
+- **Registry keys have to be referenceable.** A key with a slash or a space
+  cannot be half of a reference. Such an action stays usable from the recipe,
+  and a warning at bringup says it is not addressable.
+- **A plugin's id may not be a component's node name**, or a reference could
+  mean either of them. That fails the launch.
+
+`list_actions` over the runtime API includes a plugin's actions, each with a
+whole tool schema: however the factory was described — a string, a `function`
+block, or nothing but a docstring — the plugin's own registry makes one of it,
+so a caller building tool calls treats a plugin action like a component's.
+`list_plugin_events` lists the conditions, which an event spec names with
+`{"ref": ..., "kwargs": {...}}` in place of a topic condition.
+
+An action runs in the process hosting the plugin, which is the launcher's, the
+same one the Monitor is in. That is what makes this possible at all: the action
+a factory builds closes over the live transport, and nothing serializes it.
 
 ### Overriding for non-default deployments
 
@@ -201,6 +287,287 @@ class _MyRobotForTest(MyRobotPlugin):
 The serializable plugin spec captures whichever subclass and kwargs were used,
 so the same override survives the multiprocess launch boundary.
 
+### Bringing Up a Driver Node
+
+Some feedback is only real if a separate process is running: a LiDAR's points
+come from the vendor's driver node, not from the plugin. Which driver that is,
+and how it must be configured, is exactly the robot-specific knowledge the
+plugin exists to absorb — so declare it on the plugin rather than making every
+recipe start it by hand.
+
+Override `required_processes()` and return a `ProcessSpec` per node. The
+launcher brings them up through the same machinery as `Launcher.add_ros_node`,
+which means they get respawn, captured output, and teardown ordered with the
+rest of the recipe:
+
+```python
+from ros_sugar.robot import ProcessSpec
+
+class MyRobotPlugin(RobotPlugin):
+    def required_processes(self):
+        # Only pay for the driver if the recipe actually reads the points
+        if not {"lidar_front", "lidar_back"} & self.requested_feedbacks:
+            return []
+        return [
+            ProcessSpec(
+                package="rslidar_sdk",
+                executable="rslidar_sdk_node",
+                parameters=[self.LIDAR_CONFIG],
+                precondition=self._lidar_port_is_free,
+            )
+        ]
+```
+
+`requested_feedbacks` and `requested_commands` hold the keys the recipe's
+components actually consume, resolved from their `Topic(use_plugin=...)`
+references. A plugin usually exposes more than any one recipe needs; this is
+how it tells the difference. Both are populated before `required_processes()`
+and `on_attached()` run, and are empty when there is no launcher — a plugin
+nobody asked anything of should provide nothing, not everything.
+
+```{caution}
+Set a `precondition` for any driver that claims an exclusive resource. Most
+LiDAR drivers bind a fixed UDP port and cannot coexist with a second copy of
+themselves, and many robots already start the vendor's own instance at boot.
+A second one comes up cleanly and then simply never publishes — which reads as
+a crash and sends people looking in the wrong place. Return `False` when the
+existing instance is detected.
+```
+
+Declare processes; do not start them. A plugin that spawned its own subprocess
+would sit outside the launch system: no respawn, no captured output, no ordered
+shutdown, and a process still holding the device if the launcher is killed.
+
+### Feeding a Driver Node the Plugin's Own Telemetry
+
+Some nodes worth starting read the plugin's telemetry rather than a sensor's: a
+`robot_localization` EKF over the robot's odometry and IMU, for instance. Most
+of that telemetry is decoded from a non-ROS transport and lives only on the
+feedback bus, where a stock ROS node cannot see it. Declare what the node reads
+with `inputs`, as `{feedback_key: topic}` with the topic the node subscribes
+on, and the launcher delivers it there:
+
+```python
+ProcessSpec(
+    package="robot_localization",
+    executable="ekf_node",
+    parameters=[self.EKF_CONFIG, {"odom0": "/odom", "imu0": "/imu/data"}],
+    inputs={"Odometry": "/odom", "Imu": "/imu/data"},
+)
+```
+
+A feedback the plugin host decodes is published by the host on that topic,
+stamped with the node clock when the decoder left the stamp empty. One already
+carried on a ROS topic is not republished; the node is remapped onto the real
+topic instead. Either way the recipe has nothing to add, and nothing is
+published unless the node is actually started.
+
+Set `publish_tf=True` on an odometry `Feedback` to have the host also broadcast
+its `header.frame_id -> child_frame_id` transform whenever it publishes that
+feedback. A localizer fusing the odometry into a map frame publishes
+`map -> odom` and expects something else to own `odom -> base`; this makes the
+plugin that owner.
+
+### Publishing Plugin Telemetry for Nodes in the Recipe
+
+A node the recipe starts itself, with `Launcher.add_ros_node`, is not a driver
+the plugin declares, so it gets no `inputs`. Have the launcher publish the
+feedback it needs instead:
+
+```python
+launcher.add_plugin(robot)
+launcher.publish_plugin_feedback(robot.feedbacks["Odometry"], "/odom")
+launcher.add_ros_node("robot_localization", "ekf_node", parameters=[...])
+```
+
+The plugin host publishes it with the feedback's own message type, so nothing is
+remapped and a subscriber cannot end up on a topic of another type. The topic
+defaults to `<plugin id>/<feedback key>`. A feedback already carried on a ROS
+topic is not published again; the launcher warns and names that topic. The
+feedback counts as used by the recipe, so a plugin providing only what is asked
+for still provides it, and `publish_tf` applies as above. Bringup fails if the
+feedback belongs to no attached plugin, or if its topic is already taken by
+another feedback or by a component output.
+
+## Describing the Robot
+
+A `RobotPlugin` knows the robot it drives, so it can configure the whole stack:
+
+```python
+class MyRobotPlugin(RobotPlugin):
+    def __init__(self):
+        ...
+        self.robot_config = RobotConfig(
+            model_type=RobotType.DIFFERENTIAL_DRIVE,
+            geometry_type=RobotGeometryType.BOX,
+            geometry_params=[0.61, 0.37, 0.4],
+            ctrl_vx_limits=LinearCtrlLimits(max_vel=1.0, max_acc=2.5, max_decel=7.5),
+            ctrl_omega_limits=AngularCtrlLimits(
+                max_omega=1.5, max_acc=2.5, max_decel=4.0, max_ang=1.57
+            ),
+        )
+        self.base_frame = "base_link"
+```
+
+Both are broadcast to every component at bringup. A recipe that sets its own
+`launcher.robot` wins, but `base_frame` does **not** work that way: the plugin's
+frame always applies, because its telemetry is stamped in that frame and
+anything mounted on the plugin is placed relative to it. The two cannot
+disagree. To publish under a different name, rename it on the plugin:
+
+```python
+robot = MyRobotPlugin()
+robot.base_frame = "chassis"
+launcher.add_plugin(robot)
+```
+
+```{note}
+A robot plugin supplies only `base_frame` — the frame attached to the robot's
+body. The **world** frame describes where the robot has been *placed*, which is
+a property of the deployment rather than of the robot, so it stays with the
+recipe.
+```
+
+Name the two independently, so taking one from a plugin does not mean restating
+the other:
+
+```python
+launcher.world_frame = "odom"       # leaves the body frame to the plugin
+launcher.robot_frame = "base_link"  # only meaningful with no robot plugin attached
+```
+
+Assigning `launcher.frames = RobotFrames(...)` still works and sets both at
+once — but `RobotFrames` carries a default body frame, so naming only the world
+frame that way would hand the plugin a frame it has to override. The
+single-frame setters avoid the question.
+
+### Placing the Robot's Own Sensors
+
+A robot plugin knows where its built-in sensors sit. Declare them as `mounts`,
+with `child` set to the frame the sensor's messages name, and the launcher
+publishes each as a static transform, so consumers resolve where the sensor is
+without a URDF or a `robot_state_publisher`:
+
+```python
+from ros_sugar.robot import Mount
+
+class MyRobotPlugin(RobotPlugin):
+    def __init__(self):
+        ...
+        self.base_frame = "base_link"
+        self.mounts = [
+            Mount(parent=self, child="lidar_front", xyz=(0.30, 0.0, 0.25)),
+            Mount(parent=self, child="camera_optical", xyz=(0.25, 0.0, 0.40),
+                  rpy=(-1.571, 0.0, -1.571)),
+        ]
+```
+
+A mount without a `child` is rejected when the plugin is attached. Mounts are
+static; a sensor with moving parts publishes the transform from its own base
+frame to the moving one itself.
+
+### Declaring How the Robot Is Mapped
+
+Mapping is a one-off, operator-driven activity that produces a map on disk, so
+it is driven from the EMOS tooling rather than from a recipe. The plugin only
+declares *how* the environment gets mapped, through the `MAPPING` class
+attribute:
+
+- `VendorMapping` when the robot ships its own SLAM: the vendor tool's commands
+  as argv lists (`{name}` is substituted with the map name, `{path}` with an
+  archive path), the map store, and optional `apply`, `after_apply`, `export`,
+  `import_` and `remove` commands.
+- `NativeMapping` when EMOS builds the map itself from the plugin's own
+  feedbacks. Inputs are named by **feedback key**, not topic, so the plugin
+  stays the single source of truth for the topic behind them.
+
+```python
+from ros_sugar.robot import NativeMapping, VendorMapping
+
+class VendorMappedRobot(RobotPlugin):
+    MAPPING = VendorMapping(
+        start=["drmap", "mapping", "-b", "-n", "{name}"],
+        stop=["drmap", "stop_mapping"],
+        apply=["drmap", "apply", "{name}"],
+        after_apply=["systemctl", "restart", "localization.service"],
+        store="/var/opt/robot/data/maps",
+    )
+
+class SelfMappedRobot(RobotPlugin):
+    MAPPING = NativeMapping(cloud="lidar", imu="lidar_imu", z_max=1.2)
+```
+
+Both providers answer `active_grid_path()` with the occupancy-grid YAML of the
+active map (or `None`), so a recipe can ask either the same question. The
+declaration is part of `describe()` under `"mapping"`, tagged with
+`"kind": "vendor"` or `"native"`; a plugin that declares neither reports
+`None`.
+
+## Sensor Plugins and Frames
+
+A sensor sits somewhere, so it has a frame. Which frame is the plugin's business;
+where that frame *sits* is the recipe's.
+
+```python
+class InspectionCamera(SensorPlugin):
+    def __init__(self, host: str = "192.168.1.50"):
+        self.metadata = PluginMetadata(name="HikVision PTZ", vendor="HikVision")
+        ...
+```
+
+Every sensor gets a frame automatically — `<id>_frame` — so two of the same
+camera never collide:
+
+```python
+front = InspectionCamera(id="front_cam")                          # front_cam_frame
+rear  = InspectionCamera(id="rear_cam", frame_id="rear_optical")  # rear_optical
+```
+
+The HOST stamps that frame onto any decoded message whose `header.frame_id` is
+empty, so components can place the data without you hard-coding frame names in
+your decoders. A decoder that stamps its own frame is never overridden — a
+robot's odometry is in the localization frame, and only the decoder knows that.
+
+### Getting the frame into TF
+
+Components transform incoming data from `header.frame_id` into the robot body
+frame, which requires that transform to exist. There are two ways to provide it:
+
+**Something else already publishes it** — a URDF and `robot_state_publisher`, or
+the sensor's own driver. Declare nothing:
+
+```python
+launcher.add_plugin(InspectionCamera(id="front_cam", frame_id="front_camera_link"))
+```
+
+**Nothing publishes it** — you bolted a camera on and there is no model of it.
+Give the recipe a `Mount` and Sugarcoat publishes the static transform:
+
+```python
+from ros_sugar.robot import Mount
+
+launcher.add_plugin(
+    camera,
+    mount=Mount(parent=robot, xyz=(0.15, 0.0, 0.35), rpy=(0.0, 0.0, 1.57)),
+)
+```
+
+`parent` takes the robot plugin (using its `base_frame`), another sensor plugin,
+or a plain frame name such as the world frame for a fixed sensor. The child is
+filled in from the plugin being attached, so a recipe never repeats it.
+
+```{warning}
+Mounts are **static**. A sensor with moving parts publishes the dynamic
+transform from its own base frame to the moving one *itself*; the recipe then
+only describes where that base frame sits, and the two compose in the TF tree.
+```
+
+```{note}
+In the first form, if nothing actually publishes the frame the lookup never
+resolves and the data is used untransformed — with no error. Prefer a `Mount`
+unless you are sure the frame is in the tree.
+```
+
 ## Step 4: Use the Plugin
 
 ```python
@@ -208,7 +575,8 @@ from ros_sugar.launch import Launcher
 from my_robot_plugin import MyRobotPlugin
 
 plugin = MyRobotPlugin()                     # declarative, all args defaulted
-launcher = Launcher(robot_plugin=plugin)
+launcher = Launcher()
+launcher.add_plugin(plugin)
 launcher.add_pkg(components=[planner, controller], multiprocessing=True)
 
 # Plugin-provided event + action factories, wired with the Launcher.on() sugar
@@ -217,19 +585,65 @@ launcher.on(plugin.events.low_battery(0.15), plugin.actions.sit())
 launcher.bringup()
 ```
 
-The launcher hosts the plugin, propagates it to every component, and tears it
-down on shutdown. During activation each component looks up its input/output
-topic types in the plugin: a match on a `RosTopicTransport` re-uses the native
-subscriber/publisher-swap path, any other transport is bridged through the
-feedback bus — components remain unaware their data is not ROS.
+`add_pkg` and `add_plugin` may be called in either order — every component
+receives every plugin at bringup.
+
+The launcher hosts each plugin, propagates them to every component, and tears
+them down on shutdown. During activation each component looks up its
+input/output topics in the plugin: a match on a `RosTopicTransport` re-uses the
+native subscriber/publisher-swap path, any other transport is bridged through
+the feedback bus — components remain unaware their data is not ROS.
+
+## Recipes With Several Plugins
+
+A robot augmented with an inspection camera attaches both. Topics say which
+plugin they come from with `use_plugin`:
+
+```python
+robot  = MyRobotPlugin()
+camera = InspectionCamera(id="insp_cam")
+
+detector = VisionDetector(
+    component_name="detector",
+    inputs=[
+        # the robot plugin
+        Topic(name="odom", msg_type="Odometry", use_plugin=True),
+        # a specific plugin, by id
+        Topic(name="image", msg_type="Image", use_plugin=camera.id),
+    ],
+)
+
+launcher = Launcher()
+launcher.add_plugin(robot)
+launcher.add_plugin(camera, mount=Mount(parent=robot, xyz=(0.15, 0.0, 0.35)))
+launcher.add_pkg(components=[detector], multiprocessing=True)
+launcher.bringup()
+```
+
+`use_plugin=True` means the robot plugin, so single-robot recipes are unchanged.
+Passing `camera.id` rather than a literal string means a rename cannot leave a
+topic pointing at nothing; a name that matches no attached plugin is rejected at
+bringup, listing the plugins that are attached.
+
+Each plugin's bus channels are namespaced by its id, so two instances of the same
+camera never collide.
+
+```{note}
+Namespacing covers the feedback bus, not the ROS graph. If your plugin uses a
+`RosTopicTransport`, the topic name belongs to the driver — two instances must
+be told which topic each reads, usually with a constructor argument.
+```
 
 ## How Replacement Works
 
 During component activation, for every input topic the plugin provides a
 `Feedback` for:
 
-- `RosTopicTransport` → the component's subscriber is re-pointed at the robot's
-  topic and type.
+- `RosTopicTransport` → the component's subscriber is created on the robot's
+  topic, with the plugin's message type and QoS. The input keeps the recipe's
+  name: `component.callbacks`, `in_topics` and anything the component recorded
+  about the input are unchanged. Only the explicit `ReplaceTopic` service
+  changes an input's identity.
 - any other transport → no ROS subscription is created; decoded ROS messages
   from the feedback bus are pushed straight into the component's callback slot.
 
@@ -244,6 +658,20 @@ Decoded feedback is also injected into the Monitor's event blackboard, so
 `Event`s and `Condition`s over plugin feedback evaluate exactly as they would
 for a real ROS topic.
 
+### How Feedback Reaches Components
+
+- **Multithreaded launch** uses an in-process bus that hands every consumer, and
+  the Monitor, the *same* decoded message object, with no serialization.
+  Consumers must treat feedback messages as read-only and copy before mutating.
+- **Multiprocess launch** uses a Unix-socket bus. Messages are CDR-serialized,
+  except that types implementing the shared-memory hooks (`Image`,
+  `CompressedImage` and `PointCloud2` among the built-ins) whose payload is at
+  least 32 KiB are written to a per-feedback shared-memory ring; only a small
+  descriptor crosses the socket, and each consumer copies the frame out. A
+  frame overwritten before a consumer reads it is dropped, never delivered
+  torn. Give a custom type of your own the same treatment by implementing
+  `to_shm_payload` / `from_shm_payload`, described in {doc}`custom_types`.
+
 ## Introspection
 
 List everything a plugin exposes, programmatically or from the command line:
@@ -253,7 +681,10 @@ plugin.list_feedbacks()   # -> [FeedbackSpec, ...]
 plugin.list_commands()    # -> [CommandSpec, ...]
 plugin.list_actions()     # -> [ActionSpec, ...]
 plugin.list_events()      # -> [EventSpec, ...]
-plugin.describe()         # -> a JSON-serializable tree of all of the above
+plugin.describe()         # -> a JSON-serializable tree of all of the above,
+                          #    plus the plugin's role and mapping declaration
+plugin.id                 # -> identity within a recipe
+plugin.role               # -> PluginRole.ROBOT | PluginRole.SENSOR (read-only)
 ```
 
 ```bash
