@@ -2,7 +2,7 @@ import importlib
 from typing import List, Dict, Any, Optional
 from functools import partial
 from ..utils import logger
-from ..io.supported_types import SupportedType, get_ros_msg_fields_dict
+from ..io.supported_types import SupportedType, get_ros_msg_fields_dict, ros_msg_to_str
 
 from .utils import parse_type
 
@@ -42,9 +42,12 @@ class Task:
         self._feedback_timestamp = -1
         self._duration = None
         self._name = name
+        # Prefix of every DOM id the card uses. A subclass sets its own, so a
+        # card of another kind never takes an action's ids
+        self._dom_id = getattr(self, "_dom_id", name)
         self._type = client_type
         self._fields = fields
-        self._serving_component: Optional[str] = self.__get_server_node()
+        self._serving_component: Optional[str] = self._find_server_node()
         self.total_calls = 0
 
     def is_active(self) -> bool:
@@ -67,9 +70,13 @@ class Task:
 
         :param status: New status
         :type status: str
+        :param feedback: The feedback message, or a line about it. A card of
+            an action type's own reads the message, the log shows its text
         """
         if status:
             self._status = status
+        if feedback is not None and not isinstance(feedback, str):
+            feedback = ros_msg_to_str(feedback)
         if feedback:
             if timestep is not None:
                 # Apply timestep check for new feedback if timestep is sent
@@ -93,8 +100,8 @@ class Task:
                 Button(
                     "?",
                     cls="info-btn",
-                    id=f"{self._name}-info-btn",
-                    onclick=f"openAtButton('{self._name}-info-btn', '{self._name}-modal')",  # Method openAtButton implemented in custom.js
+                    id=f"{self._dom_id}-info-btn",
+                    onclick=f"openAtButton('{self._dom_id}-info-btn', '{self._dom_id}-modal')",  # Method openAtButton implemented in custom.js
                 ),
                 self._info,
                 cls="mb-0 gap-2",
@@ -111,40 +118,46 @@ class Task:
         client_card = DivVStacked(
             self._badge,
             cls="mt-0 gap-2",
-            id=self._name,
+            id=self._dom_id,
             ws_send=True,
         )
         inside = Grid(cls="gap-2 ml-1 mr-1 place-items-center", cols=1)
-        if self.feedback:
-            feedback_content = Div(
-                self.feedback,
-                id=f"task_{self._name}_feedback",
-                cls="m-2",
-            )
-            feedback_header = Div(
-                H6(
-                    "Feedback Log",
-                    cls="tomorrow-night-green",
-                ),
-                cls="flex flex-row justify-between items-start",
-            )
-            if self._status not in ["running", "active", "accepted", "inactive"]:
-                feedback_header(
-                    Button(
-                        cls="clear-btn",
-                        type="button",
-                        onclick=f"const feedbackDiv = document.getElementById('task_{self._name}_feedback_log'); if (feedbackDiv) feedbackDiv.remove();",
-                    )
-                )  # Clear the feedback log on click
-            feedback_card = Card(
-                feedback_content,
-                header=feedback_header,
-                cls="terminal-container feedback-container ml-2 mr-2 mt-0 overflow-y-auto max-h-[30vh] auto-scroll-bottom",
-                id=f"task_{self._name}_feedback_log",
-            )
+        feedback_card = self._feedback_card()
+        if feedback_card is not None:
             inside(feedback_card)
         inside(_in_action_client_element(self._name, self._type, self._fields))
         return client_card(inside)
+
+    def _feedback_card(self, title: str = "Feedback Log") -> Optional[FT]:
+        """The feedback log, or None while there is nothing in it
+
+        :param title: Heading of the log
+        """
+        if not self.feedback:
+            return None
+        feedback_content = Div(
+            self.feedback,
+            id=f"task_{self._dom_id}_feedback",
+            cls="m-2",
+        )
+        feedback_header = Div(
+            H6(title, cls="tomorrow-night-green"),
+            cls="flex flex-row justify-between items-start",
+        )
+        if not self.is_active() and self._status != "inactive":
+            feedback_header(
+                Button(
+                    cls="clear-btn",
+                    type="button",
+                    onclick=f"const feedbackDiv = document.getElementById('task_{self._dom_id}_feedback_log'); if (feedbackDiv) feedbackDiv.remove();",
+                )
+            )  # Clear the feedback log on click
+        return Card(
+            feedback_content,
+            header=feedback_header,
+            cls="terminal-container feedback-container ml-2 mr-2 mt-0 overflow-y-auto max-h-[30vh] auto-scroll-bottom",
+            id=f"task_{self._dom_id}_feedback_log",
+        )
 
     @property
     def feedback(self):
@@ -167,7 +180,7 @@ class Task:
         # Get the server node name
         if self._serving_component is None:
             # Try to search again
-            self._serving_component = self.__get_server_node()
+            self._serving_component = self._find_server_node()
         return (
             Dialog(
                 Card(
@@ -190,11 +203,11 @@ class Task:
                         H5("Task Info", cls="cool-subtitle-mini-blue"),
                     ),
                 ),
-                id=f"{self._name}-modal",
+                id=f"{self._dom_id}-modal",
             ),
         )
 
-    def __get_server_node(self) -> Optional[str]:
+    def _find_server_node(self) -> Optional[str]:
         """
         Executes 'ros2 action info <action_name>' and returns the active server node name if found.
         """
@@ -241,16 +254,226 @@ class Task:
                 )
             )
             if self._duration is not None:
-                minutes, seconds = divmod(self._duration, 60)
-                status_div(Span(f"{minutes}:{seconds}", cls="slick-timer"))
+                status_div(self._timer)
             return status_div
         return Span(
             self._status, cls=f"status-badge {self._status}", id="status-badge-div"
         )
 
+    @property
+    def _timer(self) -> FT:
+        """How long the task has been going, as minutes:seconds"""
+        minutes, seconds = divmod(int(self._duration or 0), 60)
+        return Span(f"{minutes}:{seconds:02d}", cls="slick-timer")
+
     def cleanup(self):
         self._feedback = []
         self._feedback_timestamp = -1
+
+
+# ---- ROUTINE ELEMENT ----
+class RoutineTask(Task):
+    """A routine among the Tasks: its steps and how far it has got, and controls
+    to start, pause, resume and abort it.
+
+    Follows the state the Monitor publishes for the routine instead of an
+    action server's feedback, and sends its controls to the Monitor by name.
+    """
+
+    #: The controls offered in each status. Any status not listed can start
+    _CONTROLS = {"running": ("pause", "abort"), "paused": ("resume", "abort")}
+
+    #: Statuses a run ends in
+    _ENDED = ("completed", "failed", "aborted")
+
+    def __init__(self, name: str):
+        """
+        :param name: Routine name
+        :type name: str
+        """
+        self._dom_id = f"routine-{name}"
+        self._state: Dict[str, Any] = {}
+        super().__init__(name=name, client_type="Routine", fields={})
+        # Until the first state arrives from the Monitor
+        self._status = "unknown"
+
+    def _find_server_node(self) -> Optional[str]:
+        """A routine runs on the Monitor, so there is no server to look up"""
+        return None
+
+    def is_active(self) -> bool:
+        """Whether a run is under way, paused included
+
+        :rtype: bool
+        """
+        return self._status in ("running", "paused")
+
+    def is_running(self) -> bool:
+        """Whether a run is under way and not paused
+
+        :rtype: bool
+        """
+        return self._status == "running"
+
+    def update_state(self, state: Optional[Dict]) -> None:
+        """Take a new state of the routine, as the Monitor published it
+
+        :param state: The routine's state, or None if none has arrived
+        :type state: Optional[Dict]
+        """
+        if not state:
+            return
+        previous_status = self._status
+        previous_index = self._state.get("index")
+        status = state.get("status", "unknown")
+        if status == "running" and previous_status in self._ENDED:
+            # A new run: the log of the last one is no longer about this one
+            self.cleanup()
+        self._state = state
+        changed = status != previous_status or state.get("index") != previous_index
+        self.update(
+            status=status,
+            feedback=self._describe(state) if changed else None,
+            duration=state.get("elapsed"),
+        )
+
+    @staticmethod
+    def _describe(state: Dict) -> Optional[str]:
+        """One line for the log about where the routine has got to"""
+        status = state.get("status")
+        steps = state.get("steps", [])
+        step = state.get("active_step")
+        if status == "running" and step:
+            return f"Step {state.get('index', 0) + 1}/{len(steps)}: {step}"
+        if status == "paused":
+            return f"Paused at '{step}'" if step else "Paused"
+        if status == "completed":
+            return "Completed"
+        if status == "failed":
+            # What the step it failed at returned
+            index = state.get("index", 0)
+            where = f" at '{steps[index]}'" if 0 <= index < len(steps) else ""
+            message = state.get("step_message")
+            return f"Failed{where}: {message}" if message else f"Failed{where}"
+        if status == "aborted":
+            reason = state.get("abort_reason")
+            return f"Aborted: {reason}" if reason else "Aborted"
+        return None
+
+    @property
+    def card(self) -> FT:
+        """The routine's card: status, steps, log and controls"""
+        routine_card = DivVStacked(
+            self._badge,
+            cls="mt-0 gap-2",
+            id=self._dom_id,
+            ws_send=True,
+        )
+        inside = Grid(cls="gap-2 ml-1 mr-1 place-items-center", cols=1)
+        inside(self._steps)
+        feedback_card = self._feedback_card(title="Routine Log")
+        if feedback_card is not None:
+            inside(feedback_card)
+        inside(self._controls)
+        return routine_card(inside)
+
+    @property
+    def _badge(self):
+        """Status, with a spinner while running and a timer while under way"""
+        if self._status == "running":
+            # One of Task's active statuses: spinner and timer
+            return super()._badge
+        badge = DivHStacked(
+            Span(
+                self._status, cls=f"status-badge {self._status}", id="status-badge-div"
+            )
+        )
+        if self._status == "paused" and self._duration is not None:
+            badge(self._timer)
+        return badge
+
+    @property
+    def _steps(self) -> FT:
+        """The steps as a checklist: done, the one under way, and what is left"""
+        steps = self._state.get("steps", [])
+        if not steps:
+            return P("Waiting for the routine's state", cls="routine-waiting")
+        index = self._state.get("index", 0)
+        checklist = Div(cls="routine-steps", id=f"{self._dom_id}-steps")
+        for position, step in enumerate(steps):
+            if self._status == "completed" or position < index:
+                mark, kind = "✓", "done"
+            elif position == index and self.is_active():
+                mark, kind = "●", "active"
+            elif position == index and self._status in ("failed", "aborted"):
+                mark, kind = "✕", "stopped"
+            else:
+                mark, kind = "○", "pending"
+            line = DivHStacked(
+                Span(mark, cls="routine-step-mark"),
+                Span(step),
+                cls=f"routine-step {kind} gap-2",
+            )
+            feedback = self._state.get("step_feedback")
+            if kind == "active" and feedback:
+                line(
+                    Span(
+                        f"{feedback.get('server_status', '')}, "
+                        f"{feedback.get('feedback_count', 0)} feedback",
+                        cls="routine-step-feedback",
+                    )
+                )
+            checklist(line)
+        return checklist
+
+    @property
+    def _controls(self) -> FT:
+        """The controls that apply to the routine's current status"""
+        commands = self._CONTROLS.get(self._status, ("start",))
+        buttons = DivHStacked(*[
+            Button(
+                command.capitalize(),
+                cls="primary-button",
+                hx_post=f"/routine/{command}",
+                hx_target="#main",
+                hx_on__before_request="this.disabled = true;",
+            )
+            for command in commands
+        ])
+        return Form(
+            DivCentered(buttons),
+            Input(name="routine_name", type="hidden", value=self._name),
+            cls="space-x-2 space-y-2 m-2",
+            id=f"{self._dom_id}-form",
+            onsubmit="event.preventDefault(); return false;",
+        )
+
+    @property
+    def _info(self):
+        """What the routine is made of"""
+        steps = self._state.get("steps", [])
+        return (
+            Dialog(
+                Card(
+                    Grid(
+                        P(Strong("Runs on: "), "Monitor"),
+                        P(Strong("Steps: "), ", ".join(steps) or "not known yet"),
+                        P(Strong("Started from the UI: "), self.total_calls),
+                        cols=1,
+                        cls="gap-1",
+                    ),
+                    header=DivHStacked(
+                        Button(
+                            "✕",
+                            cls="info-btn",
+                            onclick="this.closest('dialog').close()",
+                        ),
+                        H5("Routine Info", cls="cool-subtitle-mini-blue"),
+                    ),
+                ),
+                id=f"{self._dom_id}-modal",
+            ),
+        )
 
 
 # ---- UTILITY ELEMENTS ----
@@ -386,10 +609,15 @@ def _map_overlay_settings_panel(map_id: str, element_id: str, overlay_type: str)
     return content
 
 
-def _map_settings_modal(map_id: str, overlays: Optional[Dict] = None):
+def _map_settings_modal(
+    map_id: str,
+    overlays: Optional[Dict] = None,
+    point_inputs: Optional[List[Tuple[str, str]]] = None,
+):
     """
     Creates a popup dialog to configure Clicked Point settings and Visuals.
     overlays: dict e.g. {'robot_pose': 'overlay', 'global_plan': 'path'}
+    point_inputs: declared point-like input topics ``(name, msg_type)``
     """
     if overlays is None:
         overlays = {}
@@ -407,30 +635,36 @@ def _map_settings_modal(map_id: str, overlays: Optional[Dict] = None):
             )
         )
 
+    # --- CLICKED POINT SETTINGS (only for declared point-like inputs) ---
+    point_settings = []
+    if point_inputs:
+        point_settings.append(
+            Card(
+                H5("Published Point Settings", cls="cool-title"),
+                LabelSelect(
+                    *[
+                        # The declared message type rides on the option so the
+                        # client publishes with the right schema
+                        Option(
+                            f"{name} ({msg_type})",
+                            value=name,
+                            data_type=msg_type,
+                            selected=(index == 0),
+                        )
+                        for index, (name, msg_type) in enumerate(point_inputs)
+                    ],
+                    label="Target Topic (declared UI inputs)",
+                    name="clicked_point_topic",
+                    cls="form-input space-y-1",
+                ),
+                cls="space-y-3 mb-4 main-card",
+            )
+        )
+
     return Div(
         Div(
             Form(
-                # --- CLICKED POINT SETTINGS ---
-                Card(
-                    H5("Published Point Settings", cls="cool-title"),
-                    LabelInput(
-                        label="Topic Name",
-                        name="clicked_point_topic",
-                        value="clicked_point",
-                        placeholder="e.g. /goal_pose",
-                        cls="form-input space-y-1",
-                    ),
-                    LabelSelect(
-                        Option("PointStamped", value="PointStamped", selected=True),
-                        Option("Point", value="Point"),
-                        Option("PoseStamped", value="PoseStamped"),
-                        Option("Pose", value="Pose"),
-                        label="Message Type",
-                        name="clicked_point_type",
-                        cls="form-input space-y-1",
-                    ),
-                    cls="space-y-3 mb-4 main-card",
-                ),
+                *point_settings,
                 Card(
                     H5("Output Visuals", cls="cool-title"),
                     # 1. The ID Selector
@@ -474,11 +708,18 @@ def _map_settings_modal(map_id: str, overlays: Optional[Dict] = None):
     )
 
 
-def _map_control_buttons(map_id: str, map_output_markers: Optional[Dict] = None):
+def _map_control_buttons(
+    map_id: str,
+    map_output_markers: Optional[Dict] = None,
+    point_inputs: Optional[List[Tuple[str, str]]] = None,
+):
     """
     Overlay buttons for Zoom In/Out and Publish Point.
+
+    The Publish Point button is only rendered when at least one point-like
+    input topic is declared in the UI.
     """
-    return DivHStacked(
+    buttons = [
         # Zoom In
         Button(
             UkIcon("plus"),
@@ -495,15 +736,21 @@ def _map_control_buttons(map_id: str, map_output_markers: Optional[Dict] = None)
             type="button",
             uk_tooltip="title: Zoom Out; pos: left",
         ),
+    ]
+    if point_inputs:
         # Publish Point Button
-        Button(
-            UkIcon("mapPin"),
-            cls="glass-icon-btn",
-            onclick="togglePublishPoint(this)",  # Calls JS function
-            id=f"{map_id}-publish-btn",
-            type="button",
-            uk_tooltip="title: Publish Clicked Point; pos: left",
-        ),
+        buttons.append(
+            Button(
+                UkIcon("mapPin"),
+                cls="glass-icon-btn",
+                onclick="togglePublishPoint(this)",  # Calls JS function
+                id=f"{map_id}-publish-btn",
+                type="button",
+                uk_tooltip="title: Publish Clicked Point; pos: left",
+            )
+        )
+    return DivHStacked(
+        *buttons,
         # Settings (Gear Icon)
         Button(
             UkIcon("settings"),
@@ -514,7 +761,7 @@ def _map_control_buttons(map_id: str, map_output_markers: Optional[Dict] = None)
             uk_tooltip="title: Settings; pos: left",
         ),
         # THE SETTINGS MODAL (Hidden by default, popped up by openMapSettings)
-        _map_settings_modal(map_id, map_output_markers),
+        _map_settings_modal(map_id, map_output_markers, point_inputs),
         cls="flex flex-row space-x-2 no-drag",
     )
 
@@ -803,11 +1050,12 @@ def _in_pose_element(
         ),
         DivHStacked(
             P("Orientation (Optional):"),
-            # Toggle button for only the orientation fields (skips the first 6 position fields of the form)
+            # Toggle button for only the orientation fields, found by name so the
+            # frame id and the form's buttons are left alone
             _toggle_button(
                 onclick="""
-                                for (let i = 6; i < this.form.length -1 ; i++)
-                                {{this.form[i].hidden = !this.form[i].hidden;}}
+                                for (const name of ['ori_w', 'ori_x', 'ori_y', 'ori_z'])
+                                {const field = this.form.elements[name]; field.hidden = !field.hidden;}
                                 """
             ),
             cls="space-x-0",
@@ -845,7 +1093,8 @@ def _in_pose_element(
         ),
     )
     if stamped:
-        _pose_form_fields(
+        _pose_form_fields = (
+            *_pose_form_fields,
             Input(
                 placeholder="FrameId",
                 name="frame_id",
@@ -872,12 +1121,17 @@ def _out_image_element(topic_name: str, **_):
     )
 
 
-def _out_map_element(topic_name: str, map_output_markers: Optional[Dict] = None, **_):
+def _out_map_element(
+    topic_name: str,
+    map_output_markers: Optional[Dict] = None,
+    point_inputs: Optional[List[Tuple[str, str]]] = None,
+    **_,
+):
     """FastHTML element for output OccupancyGrid typ"""
     return (
         Grid(
             DivHStacked(
-                _map_control_buttons(topic_name, map_output_markers),
+                _map_control_buttons(topic_name, map_output_markers, point_inputs),
             ),
             Div(
                 id=topic_name,
@@ -934,7 +1188,14 @@ _INPUT_ELEMENTS: Dict = {
     "PointStamped": partial(_in_point_element, stamped=True),
     "Pose": partial(_in_pose_element, stamped=False),
     "PoseStamped": partial(_in_pose_element, stamped=True),
+    "PoseWithCovariance": partial(_in_pose_element, stamped=False),
+    "PoseWithCovarianceStamped": partial(_in_pose_element, stamped=True),
 }
+
+#: The card class of an action client, by the name of its action type. A
+#: derived package registers one for an action whose card it wants to own,
+#: instead of the Task every action client gets
+_TASK_ELEMENTS: Dict[str, type] = {}
 
 _OUTPUT_ELEMENTS: Dict = {
     "String": _log_text_element,
@@ -955,8 +1216,14 @@ _OUTPUT_ELEMENTS: Dict = {
 # ---- ADDITIONAL MESSAGES ELEMENTS ----
 
 
-def _deserialize_additional_element(k_t: str, i_t: str) -> Optional[Tuple]:
-    """Deserialize one additional element"""
+def _deserialize_additional_element(
+    k_t: str, i_t: str, supported_type_key: bool = True
+) -> Optional[Tuple]:
+    """Deserialize one additional element
+
+    :param supported_type_key: Whether the key is a message type. False for a
+        task element, whose key is the action type it is the card for
+    """
     # Get key type
     module_name_key, _, type_name = k_t.rpartition(".")
     if not module_name_key:
@@ -970,7 +1237,7 @@ def _deserialize_additional_element(k_t: str, i_t: str) -> Optional[Tuple]:
     module_key = importlib.import_module(module_name_key)
     module_item = importlib.import_module(module_name_item)
     key = getattr(module_key, type_name)
-    if not issubclass(key, SupportedType):
+    if supported_type_key and not issubclass(key, SupportedType):
         logger.error(f"Could not find {type_name} name in {module_key} module")
         return
     item = getattr(module_item, func_name)
@@ -981,10 +1248,12 @@ def _deserialize_additional_element(k_t: str, i_t: str) -> Optional[Tuple]:
 
 
 def add_additional_ui_elements(
-    input_elements: Optional[List[Tuple]], output_elements: Optional[List[Tuple]]
+    input_elements: Optional[List[Tuple]],
+    output_elements: Optional[List[Tuple]],
+    task_elements: Optional[List[Tuple]] = None,
 ):
     """Deserialize additional elements and add them"""
-    global _INPUT_ELEMENTS, _OUTPUT_ELEMENTS
+    global _INPUT_ELEMENTS, _OUTPUT_ELEMENTS, _TASK_ELEMENTS
 
     # Add input elements
     if input_elements:
@@ -1000,25 +1269,79 @@ def add_additional_ui_elements(
             if deserialized:
                 _OUTPUT_ELEMENTS[deserialized[0].__name__] = deserialized[1]
 
+    # Add task elements, keyed by the name of the action type they are for
+    if task_elements:
+        for k_t, i_t in task_elements:
+            deserialized = _deserialize_additional_element(
+                k_t, i_t, supported_type_key=False
+            )
+            if deserialized and issubclass(deserialized[1], Task):
+                _TASK_ELEMENTS[deserialized[0].__name__] = deserialized[1]
+            elif deserialized:
+                logger.error(
+                    f"The task element for '{deserialized[0].__name__}' is not a "
+                    "Task, so it cannot be a card"
+                )
+
 
 # ---- GENERIC MESSAGES ELEMENTS ----
 
 
-def _generic_message_form(msg_fields: Dict[str, Dict[str, Dict]]) -> FT:
+def _is_header_schema(field_type: Any) -> bool:
+    """Whether a field schema is a std_msgs/Header's"""
+    return (
+        isinstance(field_type, Dict)
+        and set(field_type) == {"stamp", "frame_id"}
+        and isinstance(field_type["stamp"], Dict)
+        and set(field_type["stamp"]) == {"sec", "nanosec"}
+    )
+
+
+def _generic_message_form(
+    msg_fields: Dict[str, Dict[str, Dict]], field_path: str = ""
+) -> FT:
     """Creates an input UI element (form) for any ROS2 message
+
+    Each input is named by its full path in the message ("pose.position.x"),
+    so the submitted form can be rebuilt into the nested message. A header
+    shows only its frame_id: the UI node stamps headers when it sends
 
     :param msg_fields: Dictionary of the message fields {name: type | Dict}
     :type msg_fields: Dict[str, Dict[str, Dict]]
+    :param field_path: Path of the message these fields belong to, empty at the top
+    :type field_path: str
     :return: UI form input element
     :rtype: FT
     """
     ui_fields = Grid(cls="gap-2 m-1", cols=2)
     for field_name, field_type in msg_fields.items():
+        input_name = f"{field_path}{field_name}"
+        if _is_header_schema(field_type):
+            ui_fields(
+                DivVStacked(
+                    P(f"{field_name}", cls="cool-subtitle-mini-blue m-2"),
+                    Grid(
+                        LabelInput(
+                            label="frame_id",
+                            type="text",
+                            name=f"{input_name}.frame_id",
+                            placeholder="frame_id",
+                            required=False,
+                            value="",
+                            autocomplete="off",
+                        ),
+                        cls="gap-2 m-1",
+                        cols=2,
+                    ),
+                    cls="card-border",
+                ),
+            )
+            continue
         if isinstance(field_type, Dict):
             ui_fields(
                 DivVStacked(
                     P(f"{field_name}", cls="cool-subtitle-mini-blue m-2"),
-                    _generic_message_form(field_type),
+                    _generic_message_form(field_type, f"{input_name}."),
                     cls="card-border",
                 ),
             )
@@ -1039,9 +1362,10 @@ def _generic_message_form(msg_fields: Dict[str, Dict[str, Dict]]) -> FT:
         ]:
             field_input_type = "number"
             default_value = "0"
-        elif field_type == "bool":
+        elif field_type == "boolean":
+            # Sent only when checked, and read as true. Unchecked, defaults false
             field_input_type = "checkbox"
-            default_value = "0"
+            default_value = "true"
         else:
             field_input_type = "text"
             default_value = ""
@@ -1049,7 +1373,7 @@ def _generic_message_form(msg_fields: Dict[str, Dict[str, Dict]]) -> FT:
             LabelInput(
                 label=field_name,
                 type=field_input_type,
-                name=field_name,
+                name=input_name,
                 placeholder=field_name,
                 required=False,
                 value=default_value,
@@ -1314,6 +1638,7 @@ def output_topic_card(
     topic_type: str,
     column_class: str = "",
     map_output_markers: Optional[Dict] = None,
+    point_inputs: Optional[List[Tuple[str, str]]] = None,
 ) -> FT:
     """Creates a UI element for an output topic
 
@@ -1321,11 +1646,17 @@ def output_topic_card(
     :type topic_name: str
     :param topic_type: Topic message type
     :type topic_type: str
+    :param point_inputs: Declared point-like input topics ``(name, msg_type)``
+        available as map click-to-publish targets
     :return: Output topic UI element
     """
     return Card(
         DivHStacked(H4(topic_name), _fullscreen_button(f"card-{topic_name}")),
-        _OUTPUT_ELEMENTS[topic_type](topic_name, map_output_markers=map_output_markers),
+        _OUTPUT_ELEMENTS[topic_type](
+            topic_name,
+            map_output_markers=map_output_markers,
+            point_inputs=point_inputs,
+        ),
         cls=f"m-2 {column_class} inner-main-card",
         id=f"card-{topic_name}",
     )
@@ -1455,13 +1786,15 @@ def initial_logging_card():
 
 
 def remove_child_from_logging_card(logging_card, target_id="loading-dots"):
-    """Remove the last child in logging_card.children with a matching id."""
+    """Remove and return the last child in logging_card.children with a
+    matching id (or ``None`` if not found)."""
     children = logging_card.children
 
     for i in range(len(children) - 1, -1, -1):
         if getattr(children[i], "id", None) == target_id:
             logging_card.children = children[:i] + children[i + 1 :]
-            break
+            return children[i]
+    return None
 
 
 def augment_text_in_logging_card(
@@ -1469,7 +1802,8 @@ def augment_text_in_logging_card(
     new_txt: str,
     target_id="text",
 ):
-    """Update the inner text of a child in logging_card.children with a matching id."""
+    """Update the inner text of a child in logging_card.children with a
+    matching id. Used for streaming output whose payload is the delta."""
     children = logging_card.children
     target_child = None
     for i in range(len(children) - 1, -1, -1):
@@ -1483,6 +1817,31 @@ def augment_text_in_logging_card(
         if getattr(target_child.children[i], "id", None) == "inner-text":
             # Append the new text
             target_child.children[i](Span(f"{new_txt}"))
+            return logging_card
+    return logging_card
+
+
+def replace_text_in_logging_card(
+    logging_card,
+    new_txt: str,
+    target_id="text",
+):
+    """Replace the inner text of a child in logging_card.children with a
+    matching id, keeping its source prefix. Used for streamed entries whose
+    payload is the full text so far rather than a delta."""
+    children = logging_card.children
+    target_child = None
+    for i in range(len(children) - 1, -1, -1):
+        if getattr(children[i], "id", None) == target_id:
+            target_child = children[i]
+            break
+    if not target_child:
+        return logging_card
+    for i in range(len(target_child.children) - 1, -1, -1):
+        if getattr(target_child.children[i], "id", None) == "inner-text":
+            inner = target_child.children[i]
+            # Keep the source prefix (first child), replace the text
+            inner.children = (inner.children[0], f"{new_txt}")
             return logging_card
     return logging_card
 
@@ -1503,13 +1862,17 @@ def update_logging_card(
     :return: Updated logging card
     :rtype: FT
     """
-    # Remove any previous loading that exists on the card
-    remove_child_from_logging_card(logging_card)
     # Handle errors originating from ROS node
     if data_type == "error":
         data_type = "String"
         data_src = "error"
-    return _OUTPUT_ELEMENTS[data_type](logging_card, output, data_src)
+    # The loading indicator means "waiting for the robot": robot/error output
+    # clears it
+    dots = remove_child_from_logging_card(logging_card)
+    card = _OUTPUT_ELEMENTS[data_type](logging_card, output, data_src)
+    if data_src == "user" and dots is not None:
+        logging_card(dots)
+    return card
 
 
 def update_logging_card_with_loading(logging_card):

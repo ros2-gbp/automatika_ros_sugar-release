@@ -1,17 +1,23 @@
-from typing import List, Tuple, Dict, Callable, Union, Any
+from typing import List, Optional, Tuple, Dict, Callable, Union, Any
+import importlib
+import numbers
 import re
 import sys
 import base64
+import array
+
 import numpy as np
 import cv2
-from socket import socket
 
 from rclpy.logging import get_logger
+from rosidl_runtime_py.convert import message_to_ordereddict
 import std_msgs.msg as std_msg
 from nav_msgs.msg import Odometry
 
-import msgpack
 import msgpack_numpy as m_pack
+
+from ..config import ExternalProcessorType
+from .ipc import ExternalProcessorClient, ExternalProcessorError
 
 # patch msgpack for numpy arrays
 m_pack.patch()
@@ -31,73 +37,102 @@ def convert_img_to_jpeg_str(img, node_name: str = "util") -> str:
         return base64.b64encode(buffer).decode("utf-8")
 
 
+# Image encodings to (dtype, channels), keyed lowercase
+IMAGE_ENCODINGS: Dict[str, Tuple[type, int]] = {
+    # RGB/BGR family
+    "rgb8": (np.uint8, 3),
+    "rgba8": (np.uint8, 4),
+    "rgb16": (np.uint16, 3),
+    "rgba16": (np.uint16, 4),
+    "bgr8": (np.uint8, 3),
+    "bgra8": (np.uint8, 4),
+    "bgr16": (np.uint16, 3),
+    "bgra16": (np.uint16, 4),
+    # Mono
+    "mono8": (np.uint8, 1),
+    "mono16": (np.uint16, 1),
+    # Bayer – typically raw single-channel
+    "bayer_rggb8": (np.uint8, 1),
+    "bayer_bggr8": (np.uint8, 1),
+    "bayer_gbrg8": (np.uint8, 1),
+    "bayer_grbg8": (np.uint8, 1),
+    "bayer_rggb16": (np.uint16, 1),
+    "bayer_bggr16": (np.uint16, 1),
+    "bayer_gbrg16": (np.uint16, 1),
+    "bayer_grbg16": (np.uint16, 1),
+    # CvMat types
+    "8uc1": (np.uint8, 1),
+    "8uc2": (np.uint8, 2),
+    "8uc3": (np.uint8, 3),
+    "8uc4": (np.uint8, 4),
+    "8sc1": (np.int8, 1),
+    "8sc2": (np.int8, 2),
+    "8sc3": (np.int8, 3),
+    "8sc4": (np.int8, 4),
+    "16uc1": (np.uint16, 1),
+    "16uc2": (np.uint16, 2),
+    "16uc3": (np.uint16, 3),
+    "16uc4": (np.uint16, 4),
+    "16sc1": (np.int16, 1),
+    "16sc2": (np.int16, 2),
+    "16sc3": (np.int16, 3),
+    "16sc4": (np.int16, 4),
+    "32sc1": (np.int32, 1),
+    "32sc2": (np.int32, 2),
+    "32sc3": (np.int32, 3),
+    "32sc4": (np.int32, 4),
+    "32fc1": (np.float32, 1),
+    "32fc2": (np.float32, 2),
+    "32fc3": (np.float32, 3),
+    "32fc4": (np.float32, 4),
+    "64fc1": (np.float64, 1),
+    "64fc2": (np.float64, 2),
+    "64fc3": (np.float64, 3),
+    "64fc4": (np.float64, 4),
+    "yuv422": (np.uint8, 2),
+}
+
+
 def process_encoding(encoding: str) -> Tuple[np.dtype, int]:
     """
     Returns dtype and number of channels from encoding
     """
     encoding = encoding.lower()
-
-    # Define mapping from encoding to (dtype, channels)
-    encoding_map = {
-        # RGB/BGR family
-        "rgb8": (np.uint8, 3),
-        "rgba8": (np.uint8, 4),
-        "rgb16": (np.uint16, 3),
-        "rgba16": (np.uint16, 4),
-        "bgr8": (np.uint8, 3),
-        "bgra8": (np.uint8, 4),
-        "bgr16": (np.uint16, 3),
-        "bgra16": (np.uint16, 4),
-        # Mono
-        "mono8": (np.uint8, 1),
-        "mono16": (np.uint16, 1),
-        # Bayer – typically raw single-channel
-        "bayer_rggb8": (np.uint8, 1),
-        "bayer_bggr8": (np.uint8, 1),
-        "bayer_gbrg8": (np.uint8, 1),
-        "bayer_grbg8": (np.uint8, 1),
-        "bayer_rggb16": (np.uint16, 1),
-        "bayer_bggr16": (np.uint16, 1),
-        "bayer_gbrg16": (np.uint16, 1),
-        "bayer_grbg16": (np.uint16, 1),
-        # CvMat types
-        "8uc1": (np.uint8, 1),
-        "8uc2": (np.uint8, 2),
-        "8uc3": (np.uint8, 3),
-        "8uc4": (np.uint8, 4),
-        "8sc1": (np.int8, 1),
-        "8sc2": (np.int8, 2),
-        "8sc3": (np.int8, 3),
-        "8sc4": (np.int8, 4),
-        "16uc1": (np.uint16, 1),
-        "16uc2": (np.uint16, 2),
-        "16uc3": (np.uint16, 3),
-        "16uc4": (np.uint16, 4),
-        "16sc1": (np.int16, 1),
-        "16sc2": (np.int16, 2),
-        "16sc3": (np.int16, 3),
-        "16sc4": (np.int16, 4),
-        "32sc1": (np.int32, 1),
-        "32sc2": (np.int32, 2),
-        "32sc3": (np.int32, 3),
-        "32sc4": (np.int32, 4),
-        "32fc1": (np.float32, 1),
-        "32fc2": (np.float32, 2),
-        "32fc3": (np.float32, 3),
-        "32fc4": (np.float32, 4),
-        "64fc1": (np.float64, 1),
-        "64fc2": (np.float64, 2),
-        "64fc3": (np.float64, 3),
-        "64fc4": (np.float64, 4),
-        "yuv422": (np.uint8, 2),
-    }
-
-    if encoding not in encoding_map:
+    if encoding not in IMAGE_ENCODINGS:
         if "yuv422" in encoding:
-            return encoding_map["yuv422"]
+            return IMAGE_ENCODINGS["yuv422"]
         raise ValueError(f"Unsupported encoding: {encoding}")
 
-    return encoding_map[encoding]
+    return IMAGE_ENCODINGS[encoding]
+
+
+def depth_image_metadata(
+    encoding: str, depth_scale: Optional[float] = None
+) -> Tuple[np.dtype, float]:
+    """
+    Returns (dtype, scale) for a depth image encoding, where scale converts
+    raw pixel values to meters.
+
+    Metadata only. Consumers take the raw image_pre_processing view and apply
+    the scale per-pixel on their side.
+
+    - 16UC1 / mono16: uint16 depth in millimeters -> scale 1e-3
+    - 32FC1: float32 depth in meters -> scale 1.0
+    - depth_scale overrides the encoding default, for cameras publishing
+      uint16 in non-millimeter units (e.g. some ToF sensors use 0.1mm)
+    """
+    depth_encoding_map = {
+        "16uc1": (np.dtype(np.uint16), 1e-3),
+        "mono16": (np.dtype(np.uint16), 1e-3),
+        "32fc1": (np.dtype(np.float32), 1.0),
+    }
+    key = encoding.lower()
+    if key not in depth_encoding_map:
+        raise ValueError(f"Unsupported depth image encoding: {encoding}")
+    dtype, scale = depth_encoding_map[key]
+    if depth_scale is not None:
+        scale = float(depth_scale)
+    return dtype, scale
 
 
 def image_pre_processing(img, dtype, num_channels) -> np.ndarray:
@@ -114,7 +149,8 @@ def image_pre_processing(img, dtype, num_channels) -> np.ndarray:
         np_arr.dtype.byteorder == "<"
         or (np_arr.dtype.byteorder == "=" and sys.byteorder == "little")
     ):
-        np_arr = np_arr.byteswap().newbyteorder()
+        # go through the dtype instead for np>=2 compat
+        np_arr = np_arr.byteswap().view(np_arr.dtype.newbyteorder())
 
     # Reshape
     if num_channels == 1:
@@ -489,7 +525,10 @@ def odom_from_frame1_to_frame2(
         _get_position_from_odom(pose_1_in_2),
         _get_orientation_from_odom(pose_1_in_2),
     )
-    return _get_odom_from_ndarray(transformed_pose)
+    transformed_odom = _get_odom_from_ndarray(transformed_pose)
+    transformed_odom.header = pose_target_in_1.header
+    transformed_odom.twist = pose_target_in_1.twist
+    return transformed_odom
 
 
 def _parse_array_type(arr: np.ndarray, ros_msg_cls: type) -> np.ndarray:
@@ -513,6 +552,161 @@ def _parse_array_type(arr: np.ndarray, ros_msg_cls: type) -> np.ndarray:
     elif ros_msg_cls == std_msg.Int64MultiArray:
         arr = arr.astype(np.int64)
     return arr
+
+
+def image_encoding(dtype: np.dtype, channels: int) -> str:
+    """The encoding an array of `dtype` with `channels` is published under.
+
+    The inverse of `process_encoding` is not unique. 8-bit color and grey follow
+    RGB convention. Everything else takes the CvMat form. A decoder producing
+    another layout has to name it itself.
+    """
+    dtype = np.dtype(dtype)
+    if dtype == np.uint8 and channels in (1, 3, 4):
+        return {1: "mono8", 3: "rgb8", 4: "rgba8"}[channels]
+    kind = {"u": "U", "i": "S", "f": "F"}.get(dtype.kind)
+    encoding = f"{dtype.itemsize * 8}{kind}C{channels}"
+    if kind is None or encoding.lower() not in IMAGE_ENCODINGS:
+        raise ValueError(
+            f"No image encoding is known for {dtype.name} with {channels} "
+            "channels; pass encoding="
+        )
+    return encoding
+
+
+def stamp_header(header, stamp: Optional[float], frame_id: str) -> None:
+    """Fill a header for a message built outside a publisher, which would
+    otherwise stamp it. Nothing is touched when neither value is given."""
+    if frame_id:
+        header.frame_id = frame_id
+    if stamp is not None:
+        seconds = int(stamp)
+        header.stamp.sec = seconds
+        header.stamp.nanosec = int((stamp - seconds) * 1e9)
+
+
+def stamp_unset_headers(msg: Any, stamp: Any) -> None:
+    """Stamp every header in ``msg`` whose stamp is unset, at any depth.
+
+    For messages built from a client's fields, which cannot know ROS time: a
+    header left without a stamp gets ``stamp``, one the client stamped is kept.
+    Headers inside nested messages and sequences of messages are found too, so
+    a goal's ``pose.header`` is stamped like a topic's own header.
+
+    :param msg: A ROS message
+    :param stamp: The ``builtin_interfaces/Time`` to set
+    """
+    #: The ROS type of a message header, as a message's field types name it
+    header_type = "std_msgs/Header"
+
+    if not hasattr(msg, "get_fields_and_field_types"):
+        return
+    for field_name, field_type in msg.get_fields_and_field_types().items():
+        base_type, is_sequence = _split_ros_field_type(field_type)
+        if "/" not in base_type:
+            continue
+        value = getattr(msg, field_name)
+        for item in value if is_sequence else (value,):
+            if base_type == header_type:
+                if item.stamp.sec == 0 and item.stamp.nanosec == 0:
+                    item.stamp = stamp
+            else:
+                stamp_unset_headers(item, stamp)
+
+
+#: Marks a serialized ROS message, and a binary value, so the value a caller
+#: was handed can be given back. See `to_jsonable` and
+#: `supported_types.from_jsonable`
+ROS_MSG_KEY = "__ros_msg__"
+BYTES_KEY = "__bytes_b64__"
+
+
+def ros_msg_type_name(msg_class: type) -> str:
+    """Name a ROS message type the way a reference to it is written
+
+    :param msg_class: A ROS message class
+    :return: Its 'package/msg/Type' name
+    :rtype: str
+    """
+    return f"{msg_class.__module__.split('.')[0]}/msg/{msg_class.__name__}"
+
+
+def get_ros_msg_class(type_name: str) -> type:
+    """The ROS message class a 'package/msg/Type' name refers to
+
+    :param type_name: 'package/msg/Type', or 'package/Type'
+    :raises ValueError: If no such message type can be imported
+    :rtype: type
+    """
+    parts = [part for part in str(type_name).split("/") if part]
+    if len(parts) not in (2, 3):
+        raise ValueError(f"'{type_name}' is not a 'package/msg/Type' message name")
+    try:
+        return getattr(importlib.import_module(f"{parts[0]}.msg"), parts[-1])
+    except (ImportError, AttributeError) as e:
+        raise ValueError(f"Unknown ROS message type '{type_name}': {e}") from e
+
+
+def _fields_to_jsonable(value: Any) -> Any:
+    """Coerce a message's fields into the shapes a message is rebuilt from.
+
+    A sequence field arrives as `array.array`, `bytes` or a numpy array and has
+    to become a list: `set_ros_msg_from_dict` sets a sequence from a list, and
+    rejects bytes outright. This is where this differs from the UI's
+    `msg_to_jsonable`, which base64s bytes for a browser that only displays them.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return list(value)
+    if isinstance(value, (np.ndarray, array.array)):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {key: _fields_to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_fields_to_jsonable(item) for item in value]
+    return value
+
+
+def to_jsonable(value: Any) -> Any:
+    """A value in a form that survives being sent as JSON and read back.
+
+    A ROS message, a numpy array and raw bytes are not JSON, but all of them can
+    travel as JSON: a message as its fields plus the name of its type, bytes as
+    base64, an array as a list. `supported_types.from_jsonable` rebuilds them on
+    arrival.
+
+    The type name is the part that cannot be worked out later. Everywhere else a
+    dict becomes a message - a service request, an action goal - the type comes
+    from the interface being used; an argument of a method has no declared type,
+    so it carries its own.
+
+    :param value: Anything a method may be called with
+    :rtype: Any
+    """
+    if hasattr(value, "get_fields_and_field_types"):
+        return {
+            ROS_MSG_KEY: ros_msg_type_name(type(value)),
+            "fields": _fields_to_jsonable(message_to_ordereddict(value)),
+        }
+    if isinstance(value, (bytes, bytearray)):
+        return {BYTES_KEY: base64.b64encode(bytes(value)).decode("ascii")}
+    if isinstance(value, (np.ndarray, array.array)):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {key: to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    return value
+
+
+def bytes_to_array(buffer: Any, typecode: str = "B") -> array.array:
+    """A message sequence field built on the generated setter's fast path.
+
+    rosidl assigns an ``array.array`` of the field's typecode as is. Anything
+    else is walked element by element in Python.
+    """
+    data = array.array(typecode)
+    data.frombytes(buffer)
+    return data
 
 
 def numpy_to_multiarray(arr: np.ndarray, ros_msg_cls: type, labels=None):
@@ -546,21 +740,23 @@ def numpy_to_multiarray(arr: np.ndarray, ros_msg_cls: type, labels=None):
         dim.stride = stride
         msg.layout.dim.append(dim)
 
-    # Flatten the array and convert to list for the message
-    msg.data = arr.flatten().tolist()
+    # make the generate setter take it without a per-element pass
+    typecode = msg.data.typecode
+    msg.data = bytes_to_array(arr.astype(np.dtype(typecode), copy=False).tobytes(), typecode)
 
     return msg
 
 
 def run_external_processor(
-    logger_name: str, topic_name: str, processor: Union[Callable, socket], output
+    logger_name: str,
+    topic_name: str,
+    processor: Union[Callable, ExternalProcessorClient],
+    output,
+    processor_type: ExternalProcessorType = ExternalProcessorType.MSG_POST_PROCESSOR,
+    timeout: Optional[float] = None,
 ) -> Any:
     """
-    Execute external processing using a callable or a Unix socket.
-
-    This utility function is designed to handle two scenarios:
-    1. When the processor is a callable (e.g., a function), it invokes the callable with the provided `*output` arguments.
-    2. When the processor is a Unix socket, it sends the `*output` data packed in msgpack format to the connected process and waits for a response.
+    Execute an external processor, which is either a callable or a client calling it in the launcher process.
 
     :param logger_name: The name of the logger to use for logging messages.
     :type logger_name: str
@@ -568,38 +764,123 @@ def run_external_processor(
     :param topic_name: A descriptive name for the processing topic, used in log messages.
     :type topic_name: str
 
-    :param processor: The external processor, which can be either a callable or a Unix socket.
-                      If it's a callable, it will be directly invoked with `*output`.
-                      If it's a Unix socket, data will be sent and received over this socket.
-    :type processor: Union[Callable, socket]
+    :param processor: The external processor. A callable is called directly. A client calls the processor
+                      in the launcher process (multiprocess launch).
+    :type processor: Union[Callable, ExternalProcessorClient]
 
-    :param output: Variable length argument list to be passed to the external processor.
+    :param output: The output to be processed. For processors of type FUNCTION, a dictionary
+                   of the keyword arguments to call the processor with.
     :type output: Any
 
-    :return: The result of the external processing. This can vary depending on the type of processor used.
-             For a callable, it's whatever the function returns.
-             For a Unix socket, it's the unpacked response received from the connected process.
+    :param processor_type: Type of the processor, which sets how it is called. Message processors are
+                           called with the output (processor(output=output)) and processors of type
+                           FUNCTION with the keyword arguments in output (processor(**output)).
+    :type processor_type: ExternalProcessorType
+
+    :param timeout: Time (s) to wait for a processor in the launcher process to reply. Defaults to
+                    the component's external_processor_timeout.
+    :type timeout: Optional[float]
+
+    :return: The result of the external processing. For message processors in the launcher process,
+             None if the call fails.
     :rtype: Any
 
-    :raises Exception: If an error occurs during the execution of the external processor or communication over the socket,
-                       an exception is logged with an appropriate error message.
+    :raises ExternalProcessorError: If a processor of type FUNCTION in the launcher process fails.
     """
+    kwargs = (
+        output
+        if processor_type == ExternalProcessorType.FUNCTION
+        else {"output": output}
+    )
     if isinstance(processor, Callable):
-        return processor(output=output)
+        return processor(**kwargs)
 
     try:
-        out_dict = {"output": output}
-        payload = msgpack.packb(out_dict)
-        if payload:
-            processor.sendall(payload)
-        else:
-            get_logger(logger_name).error(
-                f"Could not pack arguments for external processor in external function provided for {topic_name}"
-            )
-        result_b = processor.recv(1024)
-        result = msgpack.unpackb(result_b)
-        return result
-    except Exception as e:
+        return processor.call(kwargs, timeout=timeout)
+    except ExternalProcessorError as e:
+        if processor_type == ExternalProcessorType.FUNCTION:
+            raise
         get_logger(logger_name).error(
             f"Error in external processor for {topic_name}: {e}"
         )
+
+
+# NOTE: Scalar ROS field type names mapped when building messages from
+# JSON-shaped dicts. Conversion goes by the DECLARED field type (not the default
+# value's Python type)
+_ROS_INT_TYPES = frozenset({
+    "int8",
+    "uint8",
+    "int16",
+    "uint16",
+    "int32",
+    "uint32",
+    "int64",
+    "uint64",
+    "char",
+})
+_ROS_FLOAT_TYPES = frozenset({"float", "double", "float32", "float64"})
+
+
+def _split_ros_field_type(ros_type: str) -> Tuple[str, bool]:
+    """Split a ROS field type string into (base_type, is_sequence).
+
+    Handles ``sequence<T>``, bounded ``sequence<T, N>``, static ``T[N]``
+    and plain scalars.
+    """
+    if ros_type.startswith("sequence<"):
+        inner = ros_type[len("sequence<") :].rstrip(">")
+        return inner.split(",")[0].strip(), True
+    if "[" in ros_type:
+        return ros_type.split("[")[0], True
+    return ros_type, False
+
+
+def _convert_ros_int(value: Any) -> int:
+    """A whole number for a ROS integer field. Text holding a number is accepted,
+       since form fields arrive as text.
+    """
+    number = value
+    if isinstance(value, str):
+        try:
+            number = int(value.strip())
+        except ValueError:
+            try:
+                number = float(value.strip())
+            except ValueError:
+                raise ValueError(f"expected a whole number, got {value!r}") from None
+    if (
+        isinstance(number, (bool, np.bool_))
+        or not isinstance(number, numbers.Real)
+        or (not isinstance(number, numbers.Integral) and not float(number).is_integer())
+    ):
+        raise ValueError(f"expected a whole number, got {value!r}")
+    return int(number)
+
+
+def _convert_ros_scalar(base_type: str, value: Any) -> Any:
+    """Convert a JSON value to the Python value of a scalar ROS field type."""
+    if base_type in _ROS_INT_TYPES:
+        return _convert_ros_int(value)
+    if base_type in _ROS_FLOAT_TYPES:
+        # refuse any bools being passed as floats
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(f"expected a number, got {value!r}")
+        return float(value)
+    if base_type == "boolean":
+        # Only unambiguous values. Text accepted
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        raise ValueError(f"expected true or false, got {value!r}")
+    if base_type == "octet":
+        # rclpy represents octet as a length-1 bytes object
+        if isinstance(value, (bytes, bytearray)) and len(value) == 1:
+            return bytes(value)
+        return bytes([_convert_ros_int(value)])
+    if base_type.startswith(("string", "wstring")):
+        return str(value)
+    raise ValueError(f"unsupported ROS field type '{base_type}'")
