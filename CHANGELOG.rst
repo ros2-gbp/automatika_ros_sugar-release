@@ -2,6 +2,338 @@
 Changelog for package automatika_ros_sugar
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.8.2 (2026-10-20)
+------------------
+* (fix) Broadcasts recipe frames to all components regardless of the addition order in the recipe
+* (fix) prevents UI node from crashing in only inputs or only outputs are provided in the recipe
+* (fix) Serializes and deserializes action args/kwargs in the action dict
+* (fix) Calls stop_watching on event removal
+* (fix) Fixes using plugin feedbacks as Event sources in Monitor and Component
+* (chore) Updates routine tests
+* (fix) Adds a flag to track if a cencel request is sent to the client to avoid handling multiple requests
+* (fix) Fixes handling plugin feedbacks for plugin defined events when used with component defined actions so components subscribe to them correctly
+* (fix) Execuldes 'Execute Method" service from the Browser UI
+* (fix) Forbids UI of cancelling ongoing goals automatically
+* (feature) Adds custom_settings to NativeMapping to allow robot plugins to pass custom mapping parameters
+* (fix) Gives the UI node the plugins its topics use, so they bind to the plugin's ROS topics
+* (fix) Allows setting pose heading in the UI by dragging on the map when publishing pose-like types
+* (fix) Gives PoseWithCovariance(Stamped) inputs the pose widget with map picking, and fixes stamped pose widgets
+* (feature) Adds automatic ros message header stamp for UI inputs and handles nested headers
+* (feature) Allows using UI clicked points to publish to PoseWithCovariance(Stamped) types
+* (feature) Adds geometry_msgs PoseWithCovariance(Stamped) to supported types
+* (fix) Fixes shutting down of external process server by correctly waking and joining the accept thread
+* (chore) Fixes misbehaving tests
+* (refactor) Initial true condition evaluates for rising edge conditions
+* (fix) Passes kwargs only in the decorator as the action itself would hold and apply the static arguments
+* (fix) Fixes parsing event info for callable events which have no condition
+* (fix) Fixes resetting Fallbacks retries counter
+* (fix) Resets component fallbacks on activation
+* (fix) Limites ExecuteMethod service to public methods and component actions/fallbacks
+* (fix) Uses normalized topic name in ReplaceTopic action
+* (fix) Ensures robot config is passed to all components in launcher regardless of the setting order in the Recipe
+* (fix) Sets additional arguments to the executable in launcher regradless of the log_level setting
+* (featue) Adds remove functions for runtime removal from the action registry
+* (fix) Sets the clock to a publisher from the component and fixes setting the frame_id
+* (fix) Check for the right initial state flag in component configure/unconfigure
+* (fix) Fixes parsing Bool attributes in config update from str
+* (fix) Allows setting float attributes with int values, and fixes setting bool attributes
+* (fix) Parses reconfigure action response as tuple
+* (feature) Uses abstract sockets instead of sock files for external processors and adds a user check for them when connecting
+* (feature) Adds correct SIGTERM handling based on `ros2/launch#712 <https://github.com/ros2/launch/issues/712>`_ upstream
+* (fix) Adds destroying external processor clients during node teardown
+* (refactor) Adds correct types for external processors
+* (feature) Adds external processor type to the config module
+* (feature) Adds server/client for running external processors
+* (feature) Adds a generic function as an external processor type
+* (fix) Stops plugin feedback ROS outputs quietly when the host node is destroyed on teardown
+* (feature) Adds helper in mount to get one mount in anothers frame
+* (feature) Adds a method in Launcher to publish a plugin feedback on ROS
+* (fix) Lets launch own the process signals
+* (fix) Keeps a component executor alive when a restart destroys what it is waiting on
+* (chore) Adds test to ensure unique names usage across tests
+* (chore) Adds timed component test
+* (fix) Fixes laserscan transform and updates tests
+* (fix) Clears exec_once flag on deactivation to allow a clean re-activation of the component
+* (fix) Defaults QoS durability to the middleware default
+* (feature) Gives every plugin action a whole tool schema in the action registry
+* (feature) Adds a Plugin Actions/Events to the Monitor's registery to enable usage in Routines
+* (chore) Updates UI tests
+* (fix) Adds a warning in the Launcher about unregistered routines passed to the UI
+* (chore) Refactors test
+* (docs) Documents on_pause in the event system guide
+* (fix) Stamps a decoded feedback before handing it to anyone
+* (feature) Allows extendiong/customizing UI Task cards in child packages
+* (chore) Updates docs
+* (feature) Enables feedback publishing from plugin to ros
+* (chore) Exports the action registry entry type and kinds from ros_sugar.core
+* (refactor) Uses new routine feedback field name
+* (refactor) Uses new routine feedback fields in tests
+* (feature) Keeps each finished step's message on its routine
+* (chore) Updates dev docs
+* (chore) Updates tests
+* (feature) Adds Routine card to the front end elements and enables it in the browser UI and the API
+* (feature) Allows passing Routines to UI elements
+* (feature) Adds on_pause action to Routine
+* (feature) Adds method to get routines in Monitor
+* (refactor) Refactor routine registration flow to combine event-based and standalone routines
+* (fix) Makes Routine description non-optional
+* (fix) Adds a description to the cancel_main_goal action
+* (fix) Maintains the complete action description inside the Monito action registery
+* (chore) Updates tests and docs
+* (feature) Adds a wait Action usuable at the Recipe level
+* (fix) Ends a routine's wait step immediately when the routine is aborted or paused
+* (chore) Updates tests and docs
+* (fix) Hands the action registry to a monitor that an override built without it
+* (chore) Updates tests to use unique node names
+* (fix) Fixes goal dispatching and setteling
+* (fix) Makes routine_test independent of timing and of other test modules nodes
+* (fix) Adds explicit destruction for action clients not handled by rclpy
+* (chore) Updates dev docs
+* (fix) Adds rosidl_runtime_py to dependencies
+* (chore) Adds more tests to cover edge cases
+* (fix) Handles 'no response' case when updating a component's config from the UI
+* (fix) Fixes parsing returned Action response message
+* (fix) Adds a separate threading lock for Event evaluation
+* (fix) Adds a validator to block using a monitored action as a component fallback
+* (feature) Adds component action and service to cancel ongoing main action goal
+* (fix) Adds cancel method to action client and fixes feedback listener
+* (fix) Adds all possible spelling options for ActionReturnType contract
+* (refactor) Adds on_any method to construct a Topic Condition
+* (fix) Handles the case of a cancelled goal before the execution started
+* (fix) Adds check for all routine actions including fallback policies
+* (fix) Handles parsing actions for Routines added in Recipes to execute steps in multi-processing
+* (fix) Uses new helper to re-build argument in execute method service
+* (fix) Fixes Routine pause/resume
+* (feature) Adds methods to serialize/deserialize action arguments parsed by a routine in Monitor
+* (fix) Adds a timeout to base client send request
+* (fix) Changes component ExecuteMethod service callback group in order not to block cancel
+* (feature) Adds a callback group option to ServiceClientHandler
+* (fix) Adds method in routine to stop watching all steps events
+* (feature) Adds method in Monitor to Remove an event at runtime
+* (feature) Adds method in Action to ask the host to stop monitoring the success event
+* (feature) Declares the IMU's place in the LiDAR for native mapping in the plugins
+* (feature) Adds publishing of robot footprint frame based on the robot height
+* (feature) Vendors the js loaded from cdns for offline robots
+* (feature) Adds api security keys and browser session management to the UI along with a security management executable
+* (feature) Adds secure as the default enable_ui param to serve UI with a minted certificate over https
+* (fix) Fixes check for data type ranges when converting to ros msgs from dicts and return actual errors from service calls to be caught by callers
+* (feature) Resolves a todo for msg field name validation for msgs in lists and dicts
+* (fix) Corrects checking of bool values in the api and browser and makes bools checkboxes in the UI
+* (feature) Adds clickjacking prevention through the middleware and refactors api code
+* (feature) Adds a same origin guard for browsers
+* (fix) Adds reporting ros launch exit code on recipe exit for accurate management by third party recipe launchers (`#66 <https://github.com/automatika-robotics/sugarcoat/issues/66>`_)
+* (fix) Registers additional types passed to a component process so its topics can use them
+* (fix) Fixes refusing actions in the UI when an action is already running
+* (fix) Fixes action result logging in the browser and updates tests
+* (fix) Guards against types that dont have a callback to show a clear message when passed to ui
+* (fix) Fixes ui callback for jointstate
+* (feature) Adds faster converter for audio msgs
+* (feature) Encodes messages in different thread than the async loop
+* (fix) Fixes action duration in UI with fractional seconds
+* (fix) Fixes crash of log element for unknown output types
+* (fix) Fixes handling requests when action or service clients dont exist
+* (fix) Fixes destroying clients during deactivation of ui node
+* (feature) Adds action result to its ui output through the API
+* (fix) Fixes truthiness check for falsy values
+* (feature) Makes sampled streams skip sending if the message has not changed
+* (fix) Fixes closing websockets with correct errors instead of 403
+* (chore) Adds todo for verification in supported types
+* (feature) Adds verification for known fields in topics, services and action services for the ui
+* (fix) Adds rejecting malformed json with 400
+* (fix) Fixes route name in api so that same named topics cannot redirect to wrong publisher
+* (fix) Fixes aborting routines on exit
+* (chore) Exports SystemActionRegistery in core
+* (fix) Removes duplicate imports after rebase
+* (chore) Fixes testing action server to avoid sending multiple goals at the same time
+* (fix) Replaces test message package with exisiting dependency
+* (fix) Adds std_srv dependency
+* (chore) Adds tests for action server cancelling
+* (fix) Reject new action goals while main server has an ongoing goal and add a cancel goal service to BaseComponent
+* (chore) Ignores FastHTML session key file
+* (refactor) Removes pure pytest tests and uses launch_testing in all files
+* (refactor) Updates tests to use ActionReturnType annotation
+* (fix) Publishes Routine state with TRANSIENT_LOCAL to make sure late subscribers get the current state
+* (feature) Updates launcher to register and pass all system Action
+* (refactor) Renamed ActionResult to ActionReturnType
+* (refactor) Renamed ActionResult to ActionReturnType
+* (feature) Updates monitor to add event/action/routine at runtime
+* (feature) Adds utility to check for valid ROS message fields
+* (feature) Updates Routine to handle setting steps from spec
+* (feature) Adds action registery to be used by the MOnitor for system actions auto-discovery
+* (feature) Adds ActioonServerGoal class to handle dispatching and executing ros ation goals
+* (feature) Uses missing action execption in base action class
+* (feature) Adds Exception for missing action arguments
+* (fix) Fixes action client feedback timer stop/reset
+* (fix) Move action args/kwargs resolve inside the try/except guard
+* (docs) Adds Routine to docs
+* (docs) Adds Routine tests and updates Action tests
+* (feature) Adds Routine control to Monitor and Launcher
+* (feature) Adds Routine primitive that allows recipe-level definition of a set of Action steps
+* (refactor) Updates module to use new BaseAction/Action classes
+* (refactor) Deletes MonitoedAction module
+* (refactor) Moves old Action class into BaseAction and deletes MonitoredAction.
+  Action class now has both monitored and non-monitored options based on init config
+* (chore) Adds regression tests for Action return values
+* (refactor) Uses ActionResult in all action calls
+* (Refactor) Adds ActionResult return type to enforce [bool, str] return for all actions
+* (feature) Adds MonitoredAction tests
+* (docs) Adds MonitoredAction to developer docs
+* (feature) Handles MonitoredAction routing in Launcher
+* (feature) Adds MonitoredAction handling to BaseComponent and Monitor
+* (fix) Adds event lock guard to component
+* (feature) Adds MonitoredAction class
+* (refactor) Prepares Action class for subclassing into MonitoredAction
+* (fix) Fixes ActionServer canceling of feedback timeout
+* (docs) Adds major docs update
+* Contributors: ahr, mkabtoul
+
+0.8.1 (2026-09-13)
+------------------
+* (fix) Swaps package used in test to avoid new dependencies
+* (feature) Adds missing driver to plugin tests
+* (fix) Add Launcher check for a requested ros executable/package and raises a clear error if not available
+* (fix) Fixes test failing type check on humble
+* (feature) Adds map import export keys to the mapping config of plugin
+* (feature) Adds function to plugins to get map store path
+* (feature) Adds mapping definition in plugins
+* (refactor) Adds min omega in ctrl limits and standardizes other angular ctrl names with kompass-core
+* (refactor) Changes param for minimum velocity
+* (feature) Adds mounts to plugin sensors where a robot plugin may mount its own sensors and the launcher publishes their static tf so that a urdf is not needed
+* (fix) Keeps twist information in odom transformation
+* (fix) Adds missing twist in Odom transformation anf removes unused imports
+* (feature) Adds extra args to img senders and adds camaera info sender for plugins to use the functions directly
+* (fix) Fixes large supported type senders where msg creation was passing through rclpy's element by element passes
+* (fix) Standardizes the contract for replace input topics and makes the ros topics coming from plugins keep the recipe name while subscribing to the name supplied by the plugin
+* (feature) Adds a log once utility in base component
+* (fix) Fixes a hang where shutdown on fast emmited internal events blocking the queue from executing shutdown events
+* (feature) Allows sending launch prefixes to component processes in multiprocess launch (`#63 <https://github.com/automatika-robotics/sugarcoat/issues/63>`_)
+* (feature) Adds shared memory writer pools to plugin hosts in launcher
+* (feature) Wires in the shm encode/decode methods into plugins
+* (feature) Adds to and from shm payload methods in the supported types
+* (feature) Adds a no-copy buffer layout return method to pointcloud datatype for navigation consumers
+* (feature) Adds a minimal shared memory manager for use with plugin feedback bus for streaming large payloads
+* (feature) Bypasses serialization/deserialization for in process bus
+* (feature) Adds carries_objects property to plugin bus to avoid serialization on inprocess buses
+* Merge branch 'feature/plugin_drivers_launch' of github.com:automatika-robotics/sugarcoat into feature/plugin_drivers_launch
+* (feature) Adds depth image metadata function and corrects image pre processing for np>2 compatibility
+* (fix) Returns before setting health status if no failure is found
+* (fix) Resets error sources in health status on healthy status update
+* (fix) Fixes plugin adaptation flow in component (applies before init_variables)
+* (fix) Fixes dictionary key setting for callbacks topic names
+* (feature) Enables a Plugin to launch required drivers process by declaring them to Launcher is the driver topic is used in the Recipe
+* (fix) Makes taking projection or raw image path explicit in intrinsics
+* (chore) Adds test for check correct camera info caching behavior
+* (fix) Adds binning to the camerainfo caching key
+* (fix) Fixes checking Union[Literal[..]] in base attrs during deserialization
+* (fix) Fixes type annotation in validator
+* (refactor) Checks for fixed input attribute in callbacks during init
+* (feature) Lifts camera intrinsics datatype upstream into sugarcoat
+* (fix) Fixes type annotation in base client
+* (fix) Fixes a debug logging in sending requests
+* (feature) Adds launching external nodes and external launch files in the recipe
+* Contributors: ahr, mkabtoul
+
+0.8.0 (2026-07-30)
+------------------
+* (fix) Removes frame_id keyword arg to avoid TypeError in SensorPlugin
+* (fix) Fixes selecting the correct plugin for an event's condition topic
+* (fix) Saves condition topic 'use_plugin' for getting the event's source plugin downstream
+* (fix) Adds additional check in BaseAttrs diff_fields to check only init  attributes
+* (fix) Fixes type casting to reserve float32 in the zero-copy paths downstream
+* (feature) Adds on-detach method to Plugin class
+* (fix) Fixes dtype for default range genreation in laserscan data
+* (chore) Adds tests for checking fast path on data at the python boundary
+* (fix) Fixes rendering video frames for DOM refreshes in line with map element
+* (fix) Uses explicit_fields to update an algorithm configuration to avoid loosing updates and reverting to defaults when serializing/deserializing a component
+* (feature) Adds explicit asdict to BaseAttrs to enable serializing only changed values
+* (chore) Adds tests for tf lookup and io
+* (fix) Avoids creating TF listeners in component if source and goal frame are the same
+* (feature) Adds transformation to OccupancyGridCallback
+* (feature) Adds transformation to PointCloud and Path callbacks
+* (feature) Ensures c-contiguous output from occupancy grid after transformation in the callback
+* (feature) Sets angles dtype to float32 to keep everything in the zero-copy fast path downstream
+* (docs) Adds new sensor plugin to developer docs
+* (feature) Adds properties for setting the world frame and robot frame from the launcher and makes the Plugin frame the default
+* (feature) Allow Monitor to proadcast static transforms sent by the launcher
+* (feature) Adds range datatype from sensor messages
+* (feature) Allows to pass boolean or a plugin name to the Topic 'use_plugin' to enable multi-plugin scheme
+* (feature) Enables multi-plugin usage in launcher and components
+* (feature) Adds an owner ID to the command channel
+* (feature) Adds the plugin ID to the feedback channel to enable multi-plugins sharing the feedback bus
+* (feature) Adds Mount class to describe a sensor mount on a robot on the recipe-level
+* (feature) Adds PluginRole and splits Plugins into two types: robot and sensor
+* (chore) Updates robot plugin tests
+* (feature) Adds base frame name to robot plugin
+* (fix) Handles event subscription to non-ROS inputs from robot plugins
+* (fix) Ensure components are destroyed after test is done
+* (fix) Improves TF tests coverage
+* (fix) Adds extra check to avoid errors if deactivationg is called when component is not fully active
+* (fix) Ensures TF listeners are paused/resumed when deactivating/activating a component
+* (feature) Adds TF tests
+* (fix) Fixes handling optional nested attrs in base config
+* (fix) Removes RobotConfig attributes defaults and makes it an optional attr in a component config
+* (chore) Adds note for not throttling ui rate on high rate imu and jointstate
+* (fix) Implements StrEnum class locally for Python 3.8 compatibility
+* (tests) Adds RobotConfig test file
+* (refactor) Upstreams RobotConfig from child package
+* (feature) Adds new supported types (navsatfix and imu)
+* (feature) Adds jointstate as supported type in sugarcoat
+* (feature) Adds method for creating additional datatypes in plugins that correctly attribute the package
+* (refactor) Drops intermediate 'odom' frame from declared frames
+* (feature) Update TFListener to use the component's shared buffer if available
+* (feature) Adds transformation handling to GenericCallback and removes implementations in child callbacks
+* (feature) Adds properties to handle transformation lookup for any input
+* (feature) Creates one TF buffer per component to avoid a per-topic tf subscription
+* (refactor) Upstreams RobotFrames from child package
+* (feature) Adds failing fast when ui dependancies are not available and enable ui is requested
+* (feature) Adds option for disabling browser ui and only serve api when enabling UI
+  - Also surfaces api options in the enable ui function.
+  - Makes fasthtml/monster-ui optional dependancies when serving UI (only
+  required for broswer based UI).
+* (fix) Removes unused ui node config param
+* (fix) Fix for python3.8 compatibility
+* (chore) Adds tests for io types
+* (fix) Fixes creation of empty pose as origin in occupancy grid sender
+* (fix) Fixes check for null msg in odom callback
+* (feature) Adds posearray datatype for sending multiple stamped poses and updates laserscan and pointcloud datatypes
+* (feature) Upstreams callbacks for laserscan and pointcloud data
+* (feature) Adds pointcloud and laserscan data datatypes to upstream their callbacks in sugarcoat
+* (fix) Fixes type in speed calculation in odom callback
+* (fix) Fixes condition in input incoming data check
+* (fix) Fixes the live selection of clicked point topic from the frontend modal and adds header to stamped topics when publishing
+* (feature) Hide clicked point settings from map when topic not declared and only allow choosing between declared point like inputs
+* (feature) Surfaces pubslishing errors in maps as toasts
+* (feature) Handles topic names with slashes in the api endpoint creation
+* (chore) Updates tests for type errors from ui node
+* (fix) Fixes the type checking in creating ROS msgs from json style dicts to ensure ROS types are respected for the underlying RMW serialization
+* (chore) Adds lyrical to packaging and testing CI
+* (fix) Removes unused decorator from component
+* (fix) Fixes displaying user side inputs as echoed outputs with correct labels
+* (feature) Adds a function for replacing logging card text for new downstream streaming text behavior
+* (feature) Makes ui streaming an attribute of SupportedType so it can be set in daughter packages as well
+* (chore) Updates tests suite
+* (refactor) Updates browser side to call the same function pattern as the api
+* (refactor) Simplifies push vs rate sampled based on output type and refactors api creation function
+* (refactor) Adds form submission to json schema helpers at server side browser app and remove them from the supported types
+* (feature) Adds handling of audio publishing to ui node
+* (feature) Adds audio streaming endpoint in the api
+* (chore) Adds UI dependencies to CI
+* (feature) Adds websocket streaming endpoint for composed map (world)
+* (refactor) Simplifies getting ui content lazily rather than running it in callbacks
+* (feature) Adds callback for emitting raw data for occupancy grid ui and removes clear_last in other ui data functions
+* (chore) Adds tests for action feedback publishing
+* (feature) Adds feedback publishing through websocket endpoint to the api
+* (feature) Adds action feedback listeners to base client for action server
+* (chore) Adds tests for api websocket endpoints
+* (refactor) Moves fasthtml based browser app creation to its own module
+* (feature) Adds output streaming websockets and makes API app the default host
+* (chore) Adds tests for publishing ros msgs and calling services
+* (feature) Create endpoints for publishing ros msgs and calling services
+* (chore) Adds tests for the api in the ui node
+* (feature) Adds basic api structure and discovery in the ui node
+* (feature) Adds json serializable returns for ui content in certain callbacks (numpy -> list)
+* Contributors: ahr, mkabtoul
+
 0.7.1 (2026-06-05)
 ------------------
 * (fix) Fixes stale reference in logged warning
