@@ -16,20 +16,52 @@ import functools
 import importlib
 import inspect
 import json
+import re
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Union
 
+import msgpack
 from attrs import define, field
 from rclpy.logging import get_logger
 from rclpy.serialization import deserialize_message, serialize_message
 
-from ..config import BaseAttrs
+from ..config import BaseAttrs, RobotConfig, StrEnum
 from .bus import LOGGER_NAME, BusHandle, FeedbackBus, SocketFeedbackBus
 from .command import CommandSpec, RobotCommand
 from .feedback import Feedback, FeedbackSpec
+from .mapping import NativeMapping, VendorMapping
+from .mount import Mount
+from .process import ProcessSpec
 from .registries import ActionRegistry, ActionSpec, EventRegistry, EventSpec
+from .ros_outputs import FeedbackRosOutputs
+from .shm import PluginShmManager, ShmDescriptor, ShmReaderCache
 from .transports import Transport
 from .transports.ros import RosServiceTransport, RosTopicTransport
+
+
+# A 1-byte prefix distinguishing a CDR-serialized message from a shared-memory
+# descriptor to determine the bus type. The tag lives inside the payload and is
+# added/stripped only here. (only used in multiprocessing)
+_FB_KIND_CDR = b"\x00"  # rest is serialize_message() output
+_FB_KIND_SHM = b"\x01"  # rest is msgpack {"d": ShmDescriptor.pack(), "m": meta}
+
+#: Only feedbacks whose payload is at least this large take the SHM fast path;
+#: below it CDR is used.
+SHM_MIN_BYTES = 32 * 1024
+
+
+def _decode_shm_feedback(feedback: Feedback, reader: ShmReaderCache, body: bytes):
+    """Rebuild a feedback message from a shared-memory envelope. Used in feedback
+    consumer components.
+
+    Returns ``None`` when the frame was overwritten before it could be read. The
+    caller is expected to skip as a dropped frame.
+    """
+    env = msgpack.unpackb(body, raw=False)
+    buffer = reader.read(ShmDescriptor.unpack(env["d"]))
+    if buffer is None:
+        return None
+    return feedback.msg_type.from_shm_payload(env["m"], buffer)
 
 
 class AmbiguousPluginEntryError(LookupError):
@@ -56,22 +88,76 @@ class PluginMetadata(BaseAttrs):
     description: str = field(default="")
 
 
+#: Plugin ids end up inside ROS topic names, which reject hyphens, dots and
+#: leading digits at activation.
+_VALID_PLUGIN_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _slug(name: str) -> str:
+    """Turn a plugin's display name into a usable id.
+
+    ``"Name Version-2"`` becomes ``"name_version_2"``.
+
+    :param name: Plugin display name
+    :type name: str
+    :return: A valid plugin id
+    :rtype: str
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+    if not cleaned:
+        raise ValueError(f"Cannot derive a plugin id from '{name}'")
+    # A leading digit is not a valid ROS name start
+    if cleaned[0].isdigit():
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
 def _is_ros_transport(transport: Transport) -> bool:
     return isinstance(transport, (RosTopicTransport, RosServiceTransport))
 
 
-class RobotPlugin:
-    """Base class for robot plugins.
+class PluginRole(StrEnum):
+    """What a plugin represents in a recipe.
 
-    Subclass and populate the registries in a declarative ``init``. Keep
-    ``init`` free of I/O and accept only JSON-serializable keyword
-    arguments - the launcher serializes those into a spec so each component
-    subprocess can rebuild the plugin. Open sockets, start threads and bind
-    nodes through `RobotPluginHost`, not from ``init``.
+    The role is intrinsic to the plugin, to determine its type: a robot or a sensor.
+    The launcher uses it to enforce that a recipe describes exactly one robot, and
+    to decide what each plugin is allowed to contribute to the components.
+
     """
+
+    ROBOT = "robot"
+    SENSOR = "sensor"
+
+
+class Plugin:
+    """Base class for plugins.
+
+    Subclass `RobotPlugin` or `SensorPlugin` rather than this class directly,
+    so the plugin carries the right `PluginRole`.
+    """
+
+    #: Overridden by each role base class below. A plugin that subclasses
+    #: ``Plugin`` directly is treated as a sensor i.e something that contributes
+    #: feedback and commands but describes no robot.
+    _role: PluginRole = PluginRole.SENSOR
+
+    @property
+    def role(self) -> PluginRole:
+        """What this plugin represents. Read-only.
+
+        A plugin *is* a robot or a sensor by construction, so the role follows
+        from the base class the author subclassed.
+        """
+        return self._role
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
+        # NOTE: The role base classes in this module are part of the framework, not
+        # user plugins. Leaving their __init__ unwrapped means a user subclass
+        # that defines no __init__ of its own still gets wrapped against
+        # itself, and so reports its own name rather than its base's.
+        if cls.__module__ == __name__:
+            return
         orig_init = cls.__init__
         if getattr(orig_init, "_robotplugin_wrapped", False):
             return
@@ -85,6 +171,13 @@ class RobotPlugin:
             # they would clobber the outer subclass's ``_init_kwargs`` and
             # reset the registries to their base defaults.
             if not hasattr(self, "_init_kwargs"):
+                explicit_id = kw.pop("id", None)
+                # NOTE: Only a sensor has a frame of its own. Leaving the kwarg in
+                # place for anything else lets the wrapped __init__ raise
+                # Python's own unexpected-keyword TypeError
+                explicit_frame = (
+                    kw.pop("frame_id", None) if isinstance(self, SensorPlugin) else None
+                )
                 try:
                     bound = sig.bind(self, *args, **kw)
                     bound.apply_defaults()
@@ -95,6 +188,10 @@ class RobotPlugin:
                     init_kwargs = dict(kw)
                 object.__setattr__(self, "_init_kwargs", init_kwargs)
                 self._base_init(cls)
+                if explicit_id is not None:
+                    self._set_id(explicit_id)
+                if explicit_frame is not None:
+                    self._set_frame_id(explicit_frame)
             orig_init(self, *args, **kw)
 
         _wrapped_init._robotplugin_wrapped = True
@@ -113,6 +210,67 @@ class RobotPlugin:
         self.metadata: PluginMetadata = getattr(
             cls, "metadata", None
         ) or PluginMetadata(name=cls.__name__)
+        # Explicit identity, if the recipe passed ``id=``; otherwise ``id``
+        # derives from the metadata name (see the property below).
+        self._id: str = ""
+        # What the recipe actually asked this plugin for. Populated by the
+        # launcher at bringup; empty everywhere else. See ``requested_feedbacks``.
+        self._requested_feedbacks: FrozenSet[str] = frozenset()
+        self._requested_commands: FrozenSet[str] = frozenset()
+
+    # identity
+    @property
+    def id(self) -> str:
+        """Identity of this plugin within a recipe.
+
+        A recipe addresses a plugin from a topic by this id
+        (``Topic(..., use_plugin=cam.id)``), so it is available from the moment
+        the plugin is constructed.
+
+        Defaults to a slug of the plugin's metadata name, which is enough
+        unless two plugins of the same kind are used; those are told apart by
+        passing ``id=`` to the constructor.
+        """
+        return self._id or _slug(self.metadata.name)
+
+    def _set_id(self, plugin_id: str) -> None:
+        """Set an explicit identity. Called from ``__init__`` via ``id=``.
+
+        :param plugin_id: Identity to use, unique within the recipe.
+        :type plugin_id: str
+        :raises ValueError: If the id is not a usable ROS name token.
+        """
+        if not isinstance(plugin_id, str) or not _VALID_PLUGIN_ID.match(plugin_id):
+            raise ValueError(
+                f"'{plugin_id}' is not a usable plugin id. Plugin ids become part "
+                "of ROS topic names, so they must start with a letter or "
+                "underscore and contain only letters, digits and underscores."
+            )
+        self._id = plugin_id
+
+    def _bind_identity(self) -> None:
+        """Namespace this plugin's channels by its id, once it is attached.
+
+        :raises ValueError: If a feedback topic was already handed out under a
+            different id.
+        """
+        for feedback in self.feedbacks.values():
+            if (
+                feedback._topic is not None
+                and not feedback.is_ros_topic
+                and feedback.owner_id != self.id
+            ):
+                raise ValueError(
+                    f"Plugin '{self.metadata.name}' cannot be attached as "
+                    f"'{self.id}': its feedback '{feedback.key}' has already "
+                    "been referenced (usually by building an event from it) and "
+                    f"is bound to channel '{feedback.channel}'. Attach the "
+                    "plugin to the launcher before building events from it."
+                )
+        for feedback in self.feedbacks.values():
+            feedback.owner_id = self.id
+        for command in self.commands.values():
+            command.owner_id = self.id
 
     # spec serialization
     def to_spec(self) -> Dict[str, Any]:
@@ -128,13 +286,18 @@ class RobotPlugin:
                 f"constructor arguments {list(kwargs)}: {e}. Plugin __init__ "
                 "must accept only JSON-serializable keyword arguments."
             ) from e
-        return {"class": f"{cls.__module__}:{cls.__qualname__}", "kwargs": kwargs}
+        return {
+            "class": f"{cls.__module__}:{cls.__qualname__}",
+            "kwargs": kwargs,
+            "id": self._id,
+            "frame_id": getattr(self, "_frame_id", ""),
+        }
 
     @staticmethod
     def from_spec(
         spec: Dict[str, Any],
         bus_endpoint: Optional[Any] = None,
-    ) -> "RobotPlugin":
+    ) -> "Plugin":
         """Rebuild a plugin from a `to_spec` dict.
 
         :param spec: The spec dict produced by `to_spec`.
@@ -148,7 +311,15 @@ class RobotPlugin:
         obj: Any = module
         for part in qualname.split("."):
             obj = getattr(obj, part)
-        plugin: RobotPlugin = obj(**spec.get("kwargs", {}))
+        plugin: Plugin = obj(**spec.get("kwargs", {}))
+        # Rebind the identity the launcher assigned, so the channels this
+        # plugin subscribes to in the component process match the ones the
+        # host publishes on
+        if plugin_id := spec.get("id"):
+            plugin._set_id(plugin_id)
+        if isinstance(plugin, SensorPlugin) and (frame_id := spec.get("frame_id")):
+            plugin._set_frame_id(frame_id)
+        plugin._bind_identity()
         if bus_endpoint is not None:
             bus = SocketFeedbackBus(bus_endpoint)
             bus.connect()
@@ -168,6 +339,75 @@ class RobotPlugin:
         """
         self._bus = bus
 
+    # what the recipe asked for
+    @property
+    def requested_feedbacks(self) -> FrozenSet[str]:
+        """Keys of the feedbacks this recipe's components and events actually
+        consume.
+
+        Populated by the launcher at bringup from every component's and every
+        event's ``Topic(use_plugin=...)`` reference, resolved through
+        `resolve_feedback`, and available before `on_attached` runs.
+
+        A plugin may expose far more than any one recipe uses. This is how a
+        plugin tells the difference — chiefly to avoid paying for what nobody
+        asked for, such as starting a LiDAR driver for a recipe that never
+        looks at the points. See `required_processes`.
+
+        Empty when no launcher populated it: a `RobotPluginHost` built directly,
+        as in tests and standalone tools, has no recipe to serve. Treat empty
+        as "nothing was asked for" rather than "everything" — a standalone host
+        that started every driver a plugin knows about would be a surprise.
+        """
+        return self._requested_feedbacks
+
+    @property
+    def requested_commands(self) -> FrozenSet[str]:
+        """Keys of the commands this recipe's components actually send.
+
+        The counterpart of `requested_feedbacks`, resolved from components'
+        output topics through `resolve_command`.
+        """
+        return self._requested_commands
+
+    def _set_requested(
+        self, feedbacks: FrozenSet[str], commands: FrozenSet[str]
+    ) -> None:
+        """Record what the recipe asked for. Called by the launcher only."""
+        self._requested_feedbacks = frozenset(feedbacks)
+        self._requested_commands = frozenset(commands)
+
+    # external processes
+    def required_processes(self) -> List[ProcessSpec]:
+        """External driver nodes this plugin needs running — override in
+        subclasses that front hardware served by a separate node.
+
+        Called once per bringup in the launcher process, after
+        `requested_feedbacks` and `requested_commands` are populated and before
+        `on_attached`. Return declarations only; the launcher starts and owns
+        the processes, so they get respawn, captured output and teardown
+        ordered with the recipe.
+
+        Gate on what was actually requested, so a recipe that ignores a sensor
+        does not pay to run its driver::
+
+            def required_processes(self):
+                if not {"lidar_front", "lidar_back"} & self.requested_feedbacks:
+                    return []
+                return [ProcessSpec(package="rslidar_sdk",
+                                    executable="rslidar_sdk_node",
+                                    parameters=[self.lidar_config],
+                                    precondition=self._lidar_port_is_free)]
+
+        Anything raised here is logged and skipped: a driver that cannot be
+        declared should not take the whole recipe down with it.
+
+        :return: Processes to launch, or ``[]`` (the default) for a plugin that
+            needs none.
+        """
+        # No processes by default -- see the docstring.
+        return []
+
     # host-side customization hook
     def on_attached(self, node: Any, bus: FeedbackBus) -> None:
         """Optional host-side setup hook — override in subclasses that need it.
@@ -181,6 +421,25 @@ class RobotPlugin:
         :param node: rclpy node owned by the launcher (may be ``None`` in
             standalone/test contexts).
         :param bus: the feedback bus already attached to the plugin.
+        """
+        # No-op by default — see the docstring.
+        pass
+
+    # host-side teardown hook
+    def on_detached(self, node: Any, bus: FeedbackBus) -> None:
+        """Optional host-side teardown hook — override in subclasses.
+
+        `RobotPluginHost` calls this once on close, **before** the transports
+        are shut, so the plugin can still talk to the device. Override it to
+        leave hardware in a safe state: a lidar has to be told to stop its
+        motor, which keeps spinning otherwise, and closing the port does not
+        do it.
+
+        Anything raised here is logged and does not stop teardown.
+
+        :param node: rclpy node owned by the launcher (may be ``None`` in
+            standalone/test contexts).
+        :param bus: the feedback bus still attached to the plugin.
         """
         # No-op by default — see the docstring.
         pass
@@ -231,7 +490,7 @@ class RobotPlugin:
         # Exact key match, topic.name == plugin entry key.
         # NOTE: For ROS-typed entries we also verify the message types agree;
         # commands on non-ROS transports keep ``msg_type=None`` because the
-        # encoder, not a ROS type, defines the wire payload.
+        # encoder and not a ROS type, defines the wire payload.
         if topic_name in registry:
             entry = registry[topic_name]
             entry_type = entry.msg_type.__name__ if entry.msg_type else None
@@ -243,6 +502,11 @@ class RobotPlugin:
                     "recipe and the plugin disagree on the message type."
                 )
             return entry
+
+        # Channel match for feedbacks used in plugin's own events
+        for entry in registry.values():
+            if entry.channel == topic_name:
+                return entry
 
         # Unique-type fallback, when topic.name is just a label
         # NOTE: Entries without a ``msg_type`` (non-ROS commands) participate in
@@ -270,17 +534,47 @@ class RobotPlugin:
         self, feedback: Feedback, on_ros_msg: Callable[[Any], None]
     ) -> BusHandle:
         """Subscribe to a feedback stream; ``on_ros_msg`` is called with each
-        decoded ROS message. Used by components for non-ROS feedback."""
+        decoded ROS message. Used by components for non-ROS feedback.
+
+        On an in-process bus (multithreaded launch) the decoded message is
+        handed to ``on_ros_msg`` directly, with no serialization. Every
+        consumer and the Monitor then share the one live message instance, so
+        consumers must treat feedback messages as read-only and deep-copy
+        before mutating. On a socket bus the payload is read from shared memory
+        or deserialized, per consumer.
+        """
         if self._bus is None:
             raise RuntimeError(
                 "RobotPlugin.subscribe_feedback() called before a bus was attached"
             )
         ros_type = feedback.msg_type.get_ros_type()
+        # One shared-memory reader per subscription (only used in multiprocessing)
+        reader: Optional[ShmReaderCache] = (
+            None if self._bus.carries_objects else ShmReaderCache()
+        )
 
-        def _on_data(data: bytes) -> None:
-            on_ros_msg(deserialize_message(data, ros_type))
+        def _on_data(payload: Any) -> None:
+            if reader is None:
+                # In-process bus: payload is the live decoded message object.
+                on_ros_msg(payload)
+                return
+            if payload[:1] == _FB_KIND_SHM:
+                # Multiprocessing: payload is in shared memory
+                msg = _decode_shm_feedback(feedback, reader, payload[1:])
+                if msg is not None:  # None -> frame was missed; drop it
+                    on_ros_msg(msg)
+            else:
+                # Multiprocessing: payload is CDR-serialized
+                on_ros_msg(deserialize_message(payload[1:], ros_type))
 
-        return self._bus.subscribe(feedback.channel, _on_data)
+        handle = self._bus.subscribe(feedback.channel, _on_data)
+
+        def _unsubscribe() -> None:
+            handle.unsubscribe()
+            if reader is not None:
+                reader.close()
+
+        return BusHandle(_unsubscribe)
 
     def open_command(self, command: RobotCommand) -> None:
         """Prepare a command transport for sending from a component process.
@@ -323,6 +617,7 @@ class RobotPlugin:
 
     def describe(self) -> Dict[str, Any]:
         """Return a JSON-serializable introspection tree for this plugin."""
+        mapping = getattr(self, "MAPPING", None)
         return {
             "metadata": self.metadata.asdict(),
             "transports": {name: t.kind for name, t in self.transports.items()},
@@ -330,7 +625,90 @@ class RobotPlugin:
             "commands": [s.asdict() for s in self.list_commands()],
             "actions": [s.asdict() for s in self.list_actions()],
             "events": [s.asdict() for s in self.list_events()],
+            "mapping": mapping.spec() if mapping is not None else None,
+            "role": str(self.role),
         }
+
+
+class RobotPlugin(Plugin):
+    """A plugin for the robot itself. What moves, and what drives it.
+
+    Exactly one robot plugin may be attached to a recipe. Beyond the transports
+    and registries every plugin carries, a robot plugin can describe the robot
+    it drives, and every component is configured from that description unless
+    the recipe overrides it.
+    """
+
+    _role: PluginRole = PluginRole.ROBOT
+
+    # How this robot's environment gets mapped. A `VendorMapping` when the
+    # robot ships its own SLAM, a `NativeMapping` when EMOS builds the map
+    # from this plugin's sensor feedbacks, or ``None`` when neither.
+    MAPPING: Optional[Union[VendorMapping, NativeMapping]] = None
+
+    def _base_init(self, cls: type) -> None:
+        super()._base_init(cls)
+        # Robot geometry and kinematic description
+        self.robot_config: Optional[RobotConfig] = None
+        # Name of the rigid frame attached to the robot body. The world frame
+        # is deliberately absent: where the robot has been placed is described
+        # by the environment, not by the robot.
+        self.base_frame: Optional[str] = None
+        # Static placements of the robot's own sensors relative to the body
+        # (child = the frame the sensor's messages name). The launcher
+        # publishes them as static transforms, so consumers can resolve where
+        # a built-in sensor sits without a URDF.
+        self.mounts: List[Mount] = []
+        # Frame on the ground under the base frame. The launcher publishes it
+        # `base_height` below the base frame.
+        self.footprint_frame: str = "base_footprint"
+
+    @property
+    def base_height(self) -> Optional[float]:
+        """Height of the base frame above the ground. Half the robot's height,
+        since the geometry is centred on the base frame. None without a geometry."""
+        if self.robot_config is None:
+            return None
+        return self.robot_config.height / 2
+
+
+class SensorPlugin(Plugin):
+    """A plugin for a sensor that is not part of the robot's own hardware.
+
+    An inspection camera bolted onto a robot, or a fixed camera watching a
+    room. Several may be attached to one recipe.
+
+    A sensor sits somewhere, so it has a frame. Where that frame sits relative
+    to the robot is the recipe's business (see ``Mount``); the plugin only
+    names it. A sensor with moving parts publishes the dynamic transform from
+    this base frame to the moving one itself. The recipe then only has to
+    describe the static mount, and the two compose in the TF tree.
+    """
+
+    _role: PluginRole = PluginRole.SENSOR
+
+    def _base_init(self, cls: type) -> None:
+        super()._base_init(cls)
+        # Explicit frame, if the recipe passed ``frame_id=``; otherwise derived
+        # from the plugin id (see the property below).
+        self._frame_id: str = ""
+
+    @property
+    def frame_id(self) -> str:
+        """Name of the frame this sensor's data is expressed in.
+
+        Defaults to ``<id>_frame``, so two instances of the same sensor get
+        distinct frames without the plugin author doing anything.
+        """
+        return self._frame_id or f"{self.id}_frame"
+
+    def _set_frame_id(self, frame_id: str) -> None:
+        """Set an explicit frame. Called from ``__init__`` via ``frame_id=``."""
+        if not isinstance(frame_id, str) or not frame_id:
+            raise ValueError(
+                f"'{frame_id}' is not a usable frame id for plugin '{self.id}'."
+            )
+        self._frame_id = frame_id
 
 
 class RobotPluginHost:
@@ -352,24 +730,63 @@ class RobotPluginHost:
         receives every decoded feedback message — the launcher wires this to
         ``Monitor.feed_external_topic`` so plugin events fire on the same
         machinery as ROS-topic events.
+    :param owns_bus: Whether this host is responsible for starting and closing
+        the bus. Several plugins share one bus, and a shared bus outlives any
+        single host: the second host to open would re-bind the same address,
+        and the first to close would tear the bus down for everyone. The
+        launcher therefore owns the shared bus and passes ``False``. Defaults
+        to ``True`` so a lone host still works standalone.
     """
 
     def __init__(
         self,
-        plugin: RobotPlugin,
+        plugin: Plugin,
         node: Any,
         bus: FeedbackBus,
         monitor_feed: Optional[Callable[[str, Any], None]] = None,
+        owns_bus: bool = True,
+        shm: Optional[PluginShmManager] = None,
     ) -> None:
         self.plugin = plugin
         self.node = node
         self.bus = bus
         self.monitor_feed = monitor_feed
+        self._owns_bus = owns_bus
+        # Shared-memory writer pool for large feedbacks on the socket bus; the
+        # launcher owns it and injects it. None -> everything takes the CDR path.
+        self._shm = shm
         self._active = False
         self._keep_alive_threads: List[threading.Thread] = []
         self._keep_alive_stop: Optional[threading.Event] = None
         self._feedback_handles: List[BusHandle] = []
         self._transport_handles: List[Any] = []
+        # Feedback also published on ROS, for ROS nodes that read it there
+        self._ros_outputs = FeedbackRosOutputs(node)
+
+    def publish_on_ros(self, feedback_key: str, topic: str) -> None:
+        """Also publish a feedback on a ROS topic, for a ROS node that reads it
+        there. The launcher sets this up from `ProcessSpec.inputs`.
+
+        Only for feedback the host decodes itself: one carried on a ROS topic
+        already is on ROS, and a node reads it by remapping instead.
+
+        :param feedback_key: Key on ``plugin.feedbacks``.
+        :param topic: ROS topic to publish it on.
+        :raises KeyError: If the plugin has no such feedback.
+        :raises ValueError: If the feedback is carried on a ROS transport.
+        """
+        feedback = self.plugin.feedbacks.get(feedback_key)
+        if feedback is None:
+            raise KeyError(
+                f"Plugin '{self.plugin.id}' has no feedback '{feedback_key}'. "
+                f"Available: {sorted(self.plugin.feedbacks)}"
+            )
+        if _is_ros_transport(feedback.transport):
+            raise ValueError(
+                f"Feedback '{feedback_key}' of plugin '{self.plugin.id}' is carried "
+                "on a ROS transport already; remap the node onto its topic instead."
+            )
+        self._ros_outputs.add(feedback, topic)
 
     def open(self) -> None:
         """Bring the plugin up host-side.
@@ -382,7 +799,8 @@ class RobotPluginHost:
         if self._active:
             return
         self.plugin.set_bus(self.bus)
-        self.bus.start()
+        if self._owns_bus:
+            self.bus.start()
 
         # Open every non-ROS transport (ROS transports are handled by the
         # component's own pub/sub machinery).
@@ -423,9 +841,20 @@ class RobotPluginHost:
         if not self._active:
             return
         self._stop_keep_alive()
+        # Before the transports go, so the plugin can still reach the device to
+        # leave it in a safe state
+        try:
+            self.plugin.on_detached(self.node, self.bus)
+        except Exception as e:  # pragma: no cover - defensive
+            get_logger(LOGGER_NAME).error(
+                f"Error in on_detached for plugin '{self.plugin.id}': {e}"
+            )
         for handle in self._transport_handles:
             handle.unsubscribe()
         self._transport_handles.clear()
+        # After the decoders are unhooked, so nothing publishes on a released
+        # publisher
+        self._ros_outputs.close()
         for handle in self._feedback_handles:
             handle.unsubscribe()
         self._feedback_handles.clear()
@@ -437,7 +866,8 @@ class RobotPluginHost:
                     get_logger(LOGGER_NAME).error(
                         f"Error closing transport '{transport.name}': {e}"
                     )
-        self.bus.close()
+        if self._owns_bus:
+            self.bus.close()
         self._active = False
 
     # internals
@@ -457,9 +887,85 @@ class RobotPluginHost:
             return
         if msg is None:
             return
-        self.bus.publish(feedback.channel, serialize_message(msg))
+        self._stamp_header(feedback, msg)
+        if self.bus.carries_objects:
+            # In-process bus: hand over the live object, no serialization.
+            self.bus.publish(feedback.channel, msg)
+        else:
+            self.bus.publish(feedback.channel, self._encode_feedback(feedback, msg))
         if self.monitor_feed is not None:
             self.monitor_feed(feedback.channel, msg)
+        self._ros_outputs.publish(feedback, msg)
+
+    def _encode_feedback(self, feedback: Feedback, msg: Any) -> bytes:
+        """Encode a feedback for the socket bus, tagged with its payload kind.
+
+        Large, feedbacks (camera frames, point clouds) go through the shared-memory
+        ring. The frame is written to a slot and only a tiny descriptor goes through
+        the bus. Everything else and any SHM failure falls back to CDR. .
+        """
+        if self._shm is not None:
+            shm_payload = feedback.msg_type.to_shm_payload(msg)
+            if shm_payload is not None:
+                # if shared memory feedback is implemented in the type
+                meta, view = shm_payload
+                if view.nbytes >= SHM_MIN_BYTES:
+                    try:
+                        writer = self._shm.writer_for(self.plugin.id, feedback.key)
+                        desc = writer.write(view)
+                        return _FB_KIND_SHM + msgpack.packb(  # pyright: ignore[reportOperatorIssue]
+                            {"d": desc.pack(), "m": meta}, use_bin_type=True
+                        )
+                    except Exception as e:  # pragma: no cover - defensive
+                        get_logger(LOGGER_NAME).warning(
+                            f"SHM encode for feedback '{feedback.key}' failed; "
+                            f"using CDR: {e}"
+                        )
+        # else: return serialized feedback
+        return _FB_KIND_CDR + serialize_message(msg)
+
+    def _stamp_header(self, feedback: Feedback, msg: Any) -> None:
+        """Fill in the frame a decoded message is in, and when it arrived.
+
+        Components look up ``header.frame_id -> robot base`` to place incoming
+        data, so an unstamped message is silently never transformed. Rather
+        than making every plugin author hard-code frame names in their
+        decoders, the frame is taken from the feedback (or the plugin) and
+        applied here. Decoders commonly leave the time empty too, and a
+        consumer such as an EKF orders its measurements by it.
+
+        An author who stamps the message themselves is never overridden: a
+        robot's odometry is in the localization frame, not in a frame attached
+        to the robot's body, and only the decoder knows that.
+
+        Done before the message is handed anywhere, so the bus, the Monitor and
+        the ROS topics all carry the same stamp, and the in-process bus - which
+        hands over the very object - cannot have it change under a consumer.
+        """
+        header = getattr(msg, "header", None)
+        if header is None:
+            return
+        if not getattr(header, "frame_id", None):
+            frame_id = feedback.frame_id or getattr(self.plugin, "frame_id", "")
+            if frame_id:
+                header.frame_id = frame_id
+        if header.stamp.sec == 0 and header.stamp.nanosec == 0:
+            now = self._now()
+            if now is not None:
+                header.stamp = now
+
+    def _now(self) -> Any:
+        """The host node's time, or None when it has no node to read it from.
+
+        The node's clock rather than the wall clock, so a message is stamped in
+        the same time base as everything else in the recipe, `use_sim_time`
+        included.
+        """
+        try:
+            return self.node.get_clock().now().to_msg()
+        except AttributeError:
+            # A standalone or test host has no node, and ROS time with it
+            return None
 
     def _forward_command(self, command: RobotCommand, payload: bytes) -> None:
         """Host-side handler for ``route_via_host`` commands."""
