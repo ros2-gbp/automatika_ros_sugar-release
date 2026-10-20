@@ -13,7 +13,7 @@ from typing import (
 import functools
 from copy import deepcopy
 import numpy as np
-from attrs import asdict, define, fields_dict
+from attrs import asdict, define, fields, fields_dict, has
 from attrs import Attribute
 import yaml
 import toml
@@ -34,6 +34,90 @@ FUNC_NAME_MAP = {
 
 def skip_no_init(a: Attribute, _) -> bool:
     return a.init
+
+
+def _json_safe_value(_inst, _field, value: Any) -> Any:
+    """`attrs.asdict` value serializer turning numpy arrays into plain lists."""
+    return value.tolist() if isinstance(value, np.ndarray) else value
+
+
+def _equal_values(value: Any, other: Any) -> bool:
+    """Compare two serialized field values, tolerating numpy arrays.
+
+    A plain `==` on arrays returns an array rather than a bool, so comparing
+    configs field by field needs this.
+    """
+    if isinstance(value, np.ndarray) or isinstance(other, np.ndarray):
+        return np.array_equal(np.asarray(value), np.asarray(other))
+    return bool(value == other)
+
+
+def explicit_fields(config: Any) -> Dict:
+    """The fields of an attrs config that differ from its class defaults.
+
+    A full `asdict` cannot tell a value the caller chose from one that is
+    simply the class default. Anything consuming such a dict has to write
+    every key back, which reverts values its consumer set for itself. This
+    keeps only the fields that were actually changed.
+
+    Values are also made JSON-safe (numpy arrays become lists).
+    `BaseAttrs.from_dict` converts them back on the way in.
+
+    Takes any attrs instance rather than a `BaseAttrs`: algorithm configs come
+    from whichever library implements the algorithm, and need not derive from
+    the base class in this package.
+
+    NOTE: a field explicitly set to a value equal to its default is
+    indistinguishable from one never set, and is dropped. That is harmless for
+    a plain override, but means it cannot be used to defend a default against a
+    consumer that would otherwise fill the field in.
+
+    :param config: Any attrs class instance
+    :type config: Any
+    :return: Fields that differ from the defaults
+    :rtype: dict
+    """
+    try:
+        defaults = config.__class__()
+    except TypeError:
+        # Not default-constructible, so there is nothing to compare against
+        return asdict(config, value_serializer=_json_safe_value)
+    return _diff_fields(config, defaults)
+
+
+def _diff_fields(config: Any, defaults: Any) -> Dict:
+    """Fields of `config` that differ from the matching ones on `defaults`.
+
+    Descends into nested attrs instances so a single changed sub-field does
+    not drag its siblings' defaults along with it.
+    """
+    current_serialized = asdict(config, value_serializer=_json_safe_value)
+    defaults_serialized = asdict(defaults, value_serializer=_json_safe_value)
+
+    diff = {}
+    for attribute in fields(config.__class__):
+        name = attribute.name
+        # `from_dict` only ever writes back init fields, so a computed one that
+        # happens to differ from its default would be carried and then silently
+        # dropped on the way in
+        if not attribute.init or name not in current_serialized:
+            continue
+        value = getattr(config, name)
+        default = getattr(defaults, name, None)
+        # Compare the instances, not the serialized dicts, to decide whether
+        # this is a nested config: a field can serialize to a dict without
+        # from_dict treating it as one
+        if (
+            has(value.__class__)
+            and has(default.__class__)
+            and value.__class__ is default.__class__
+        ):
+            if nested := _diff_fields(value, default):
+                diff[name] = nested
+            continue
+        if not _equal_values(current_serialized[name], defaults_serialized.get(name)):
+            diff[name] = current_serialized[name]
+    return diff
 
 
 @define
@@ -85,6 +169,53 @@ class BaseAttrs:
         return getattr(some_type, "__origin__", None)
 
     @classmethod
+    def __nested_attrs_type(cls, attribute_type) -> Optional[type]:
+        """Get the attrs class an attribute can hold, if any.
+
+        Used for optional nested configs: when the attribute is currently None
+        there is no instance to deserialize into, so the declared type is the
+        only thing that says what to rebuild.
+
+        :param attribute_type: Declared type of the attribute
+        :return: The attrs class, or None if the attribute holds no attrs class
+        :rtype: Optional[type]
+        """
+        candidates = (
+            cls.__get_subscribed_generic_simple_types(attribute_type)
+            if cls.__is_subscripted_generic(attribute_type)
+            else [attribute_type]
+        )
+        for candidate in candidates:
+            if hasattr(candidate, "__attrs_attrs__"):
+                return candidate
+        return None
+
+    @classmethod
+    def __build_nested(cls, target_cls: type, value: Dict):
+        """Construct an attrs class from a serialized dict.
+
+        Recurses so that nested configs arrive as their own class rather than
+        as raw dictionaries, which would otherwise be stored as-is and blow up
+        at first use.
+
+        :param target_cls: The attrs class to construct
+        :param value: Serialized attribute values
+        :return: An instance of ``target_cls``
+        """
+        target_fields = fields_dict(target_cls)
+        kwargs = {}
+        for key, item in value.items():
+            attribute = target_fields.get(key)
+            if attribute is None or not attribute.init:
+                continue
+            nested_cls = cls.__nested_attrs_type(attribute.type)
+            if nested_cls is not None and isinstance(item, Dict):
+                item = cls.__build_nested(nested_cls, item)
+            # attrs strips the leading underscore of private fields for __init__
+            kwargs[attribute.alias] = item
+        return target_cls(**kwargs)
+
+    @classmethod
     def __get_subscribed_generic_simple_types(cls, sg_type) -> List:
         _types = get_args(sg_type)
         _parsed_types = []
@@ -112,6 +243,16 @@ class BaseAttrs:
         """
         return self.asdict()
 
+    def asdict_explicit(self) -> Dict:
+        """Convert to dict, keeping only what differs from the class defaults.
+
+        See `explicit_fields`, which this defers to.
+
+        :return: Fields that differ from the defaults
+        :rtype: dict
+        """
+        return explicit_fields(self)
+
     def __check_value_against_attr_type(
         self, key: str, value: Any, attribute_to_set: Any, attribute_type: type
     ):
@@ -135,8 +276,19 @@ class BaseAttrs:
         if generic_type := self.__is_subscripted_generic(attribute_type):
             _types = self.__get_subscribed_generic_simple_types(attribute_type)
             if generic_type is Union:
+                # A Literal inside (e.g. Optional[Literal["a", "b"]]) cannot be
+                # isinstance checked. We match it by value instead
+                literal_values = [
+                    arg
+                    for t in _types
+                    if get_origin(t) is Literal
+                    for arg in get_args(t)
+                ]
+                others = [t for t in _types if get_origin(t) is not Literal]
                 # Check if the value type is one of the valid union types
-                if not any(isinstance(value, t) for t in _types):
+                if value not in literal_values and not any(
+                    isinstance(value, t) for t in others
+                ):
                     raise TypeError(
                         f"Trying to set with incompatible type. Attribute {key} expecting '{type(attribute_to_set)}' got '{type(value)}'"
                     )
@@ -146,8 +298,10 @@ class BaseAttrs:
                         f"Trying to set a Literal attribute with incompatible value. Attribute {key} expecting '{_types}' got '{value}'"
                     )
         elif isinstance(value, List) and attribute_type is np.ndarray:
-            # Turn list into numpy array
-            value = np.array(value)
+            # Turn list into numpy array, keeping the dtype the attribute
+            # already carries.
+            dtype = getattr(attribute_to_set, "dtype", None)
+            value = np.array(value, dtype=dtype) if dtype else np.array(value)
             # NOTE: Silent failures can happen if someone passes wrong
             # datatypes in YAML/TOML/JSON config files for non-generic /
             # non-Union / non-Literal types
@@ -198,6 +352,15 @@ class BaseAttrs:
                         f"Trying to set with incompatible type. Attribute {key} expecting dictionary got '{type(value)}'"
                     )
                 attribute_to_set.from_dict(value)
+            elif (
+                isinstance(value, Dict)
+                and attribute_to_set is None
+                and attribute_type
+                and (nested_cls := self.__nested_attrs_type(attribute_type))
+            ):
+                # An optional nested config that is currently unset: there is no
+                # instance to deserialize into, so build one from the declared type
+                setattr(self, key, self.__build_nested(nested_cls, value))
             elif isinstance(attribute_to_set, List) and attribute_to_set:
                 setattr(
                     self,
@@ -444,6 +607,16 @@ class BaseAttrs:
             raise TypeError(
                 f"Class '{self.__class__.__name__}' attribute '{attr_name}' type unknown"
             )
+
+        # NOTE: A bool is an int to isinstance
+        if attribute_type in (int, float) and isinstance(attr_value, bool):
+            raise TypeError(
+                f"Class '{self.__class__.__name__}' attribute '{attr_name}' expecting type '{attribute_type}', got {type(attr_value)}"
+            )
+
+        # Allow to pass int values to float attributes
+        if attribute_type is float and isinstance(attr_value, int):
+            attr_value = float(attr_value)
 
         if not isinstance(attr_value, attribute_type):
             raise TypeError(
