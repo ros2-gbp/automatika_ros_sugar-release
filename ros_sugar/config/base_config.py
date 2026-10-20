@@ -2,12 +2,13 @@
 
 from enum import Enum
 from typing import List, Union, Optional
-from attrs import define, field
+from attrs import define, field, Factory
 from rclpy import qos
 from rclpy.logging import LoggingSeverity
 
 from . import base_validators
 from .base_attrs import BaseAttrs
+from .robot import RobotFrames, RobotConfig
 
 __all__ = ["QoSConfig", "BaseComponentConfig", "BaseConfig", "ComponentRunType"]
 
@@ -47,8 +48,8 @@ class QoSConfig(BaseAttrs):
       - Level of reliability in delivering samples
 
     * - **durability**
-      - `int`, `qos.DurabilityPolicy.VOLATILE`
-      - Determines if the publisher will be persisting samples for “late-joining” subscriptions (Transit Local) or not (Volatile)
+      - `int`, `qos.DurabilityPolicy.SYSTEM_DEFAULT`
+      - Determines if the publisher will be persisting samples for “late-joining” subscriptions (Transit Local) or not (Volatile). The default leaves it to the middleware, which is volatile
     ```
     """
 
@@ -75,9 +76,10 @@ class QoSConfig(BaseAttrs):
 
     # Transient local: the publisher becomes responsible for persisting samples for “late-joining” subscriptions
     # Volatile: no attempt is made to persist samples
+    # System default: whatever the middleware does, which is volatile.
     durability: int = field(
         converter=_get_enum_value,
-        default=qos.DurabilityPolicy.VOLATILE,
+        default=qos.DurabilityPolicy.SYSTEM_DEFAULT,
         validator=base_validators.in_(list(qos.DurabilityPolicy)),
     )
 
@@ -209,10 +211,13 @@ class ExternalProcessorType(Enum):
     External processor type:
     - MSG_PRE_PROCESSOR: Executes before publishing a ros msg
     - MSG_POST_PROCESSOR: Executes after receiving a ros msg in a callback
+    - FUNCTION: A function called by the component with keyword arguments,
+      not attached to a topic (e.g. a custom data processing function)
     """
 
     MSG_PRE_PROCESSOR = "MsgPreProcessor"
     MSG_POST_PROCESSOR = "MsgPostProcessor"
+    FUNCTION = "Function"
 
     @classmethod
     def values(cls):
@@ -297,14 +302,25 @@ class BaseComponentConfig(BaseConfig):
 
     :param wait_for_restart_time: Time (in seconds) the component waits for a node to come back online after restart. Used to avoid infinite restart loops. Recommended to use a high value.
     :type wait_for_restart_time: float
+
+    :param robot: Physical description of the robot (motion model, geometry, control limits).
+        Defaults to None: components that do not reason about the robot's body never need it,
+        and those that do should fail loudly rather than assume a robot that does not exist.
+    :type robot: Optional[RobotConfig]
+
+    :param frames: Robot coordinate frames incoming data is transformed into.
+    :type frames: RobotFrames
+
+    :param external_processor_timeout: Time (in seconds) to wait for an external processor to reply,
+        when it runs in the launcher process (multiprocess launch).
+    :type external_processor_timeout: float
     """
 
     _use_without_launcher: bool = field(default=False, init=False)
 
-    # NOTE: Layer ID to be added in coming updates
-    # layer_id: int = field(
-    #     default=0, validator=base_validators.in_range(min_value=0, max_value=1e3)
-    # )
+    robot: Optional[RobotConfig] = field(default=None)
+
+    frames: RobotFrames = field(default=Factory(RobotFrames))
 
     fallback_rate: float = field(
         default=100.0, validator=base_validators.in_range(min_value=1e-9, max_value=1e9)
@@ -316,6 +332,10 @@ class BaseComponentConfig(BaseConfig):
 
     rclpy_log_level: str = field(
         default='warn', converter=_convert_logging_severity_to_str
+    )
+
+    external_processor_timeout: float = field(
+        default=1.0, validator=base_validators.in_range(min_value=1e-3, max_value=1e9)
     )
 
     _run_type: ComponentRunType = field(
